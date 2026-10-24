@@ -1,0 +1,46 @@
+# Production stack.
+#
+# Prepare the server-side configuration first:
+#   cp .env.example .env    # then set the real provider keys and CORS origin
+# `.env` is git-ignored and is never baked into an image. It is required here on
+# purpose, so the stack refuses to start without its configuration.
+#
+# Only the frontend publishes a port. The backend is reachable solely through
+# the Nginx reverse proxy on the Compose network, where `backend` resolves to
+# the backend service.
+services:
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - .env
+    environment:
+      # Consented evaluation records must survive a container recreate and land
+      # on the bind mount below. Without this override the container-relative
+      # default resolves outside /app.
+      CORRECTION_LOG_PATH: /app/logs/corrections.jsonl
+    volumes:
+      # The host directory must be writable by UID 10001 (the image's app user),
+      # for example: install -d -m 700 -o 10001 -g 10001 logs
+      - ./logs:/app/logs
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "80:80"
+    restart: unless-stopped

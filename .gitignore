@@ -7,7 +7,10 @@
 secrets/
 credentials.json
 Run-virastar.docx
-/context/
+# Local design notes stay out of Git, except the prompt specification that the
+# backend test suite reads and must keep in sync with the code.
+/context/*
+!/context/correction-prompt.md
 /.freebuff/
 
 # Node / frontend
