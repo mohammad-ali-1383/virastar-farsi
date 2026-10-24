@@ -1,0 +1,54 @@
+# Local development stack (Phase 1).
+# Copy `.env.example` to `.env` before running. Never commit real secrets.
+services:
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      # The only backend setting Compose overrides. Consented evaluation records
+      # are written to the mounted host directory instead of the image layer, so
+      # they survive a container recreate. `logs/` is git-ignored.
+      #
+      # APP_ENV, MAX_TEXT_LENGTH, CORS_ORIGINS, and the provider settings are NOT
+      # set here: they come from the root `.env` (env_file below) or the
+      # application defaults, so one `.env` configures both workflows.
+      CORRECTION_LOG_PATH: /app/logs/corrections.jsonl
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # Mount only the application package for reload during development.
+      - ./backend/app:/app/app
+      # Keep consented evaluation logs on the host (git-ignored `logs/`).
+      - ./logs:/app/logs
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      # Vite gives real environment variables precedence over `frontend/.env`,
+      # so this value wins inside the Compose stack. The browser calls the
+      # backend through the published localhost:8000 port.
+      VITE_API_BASE_URL: http://localhost:8000
+    volumes:
+      # Mount the source for hot reload while keeping container node_modules.
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    command: npm run dev

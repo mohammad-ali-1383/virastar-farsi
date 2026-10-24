@@ -1,0 +1,7 @@
+# Backend runtime dependencies — V1 (pinned)
+fastapi==0.143.1
+uvicorn[standard]==0.54.0
+pydantic==2.14.1
+pydantic-settings==2.15.0
+# Used by the LLM adapter (Phase 3) and by FastAPI's test client.
+httpx==0.28.1

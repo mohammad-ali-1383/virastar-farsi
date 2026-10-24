@@ -1,0 +1,3 @@
+# Backend development/test dependencies — V1 (pinned)
+-r requirements.txt
+pytest==9.1.1
