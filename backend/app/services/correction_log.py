@@ -3,10 +3,10 @@
 When — and only when — a request explicitly asks for it, the backend appends one
 JSON Lines record per successful correction to a dedicated file
 (``CORRECTION_LOG_PATH``, default ``<repo root>/logs/corrections.jsonl``). The
-record holds the timestamp, the original text, the **provider and model that
-actually produced the correction** (which may be the Gemini fallback), and the
-final corrected text, so the quality of the prompt and of each provider can be
-evaluated later.
+record holds the timestamp, the original text, the **provider slot and model that
+actually produced the correction** (which may be a later slot in the fallback
+chain), and the final corrected text, so the quality of the prompt and of each
+provider can be evaluated later.
 
 Privacy rules (`coding-rules.md` -> Security):
 

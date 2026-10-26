@@ -1,42 +1,54 @@
 """Shared fixtures for the backend test suite.
 
 Provider traffic is always mocked: the correction service is replaced by a stub
-for API tests, and the real provider adapters are exercised through
+for API tests, and the real provider adapter is exercised through
 ``httpx.MockTransport`` so no external call is ever made
 (`testing.md`, `coding-rules.md` -> Testing).
+
+The provider layer is configured with numbered slots (`API_KEY_N`, `BASE_URL_N`,
+`MODEL_N`, ...). The ``provider_slots`` fixture defines two complete slots with
+placeholder keys and unsets every slot variable that the machine might carry, so
+the tests describe their own provider configuration instead of inheriting one.
 """
 
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import SecretStr
 
+import app.config as app_config
 from app.config import settings
 from app.main import app
 from app.services.correction import CorrectionResult, get_correction_service
-from app.services.correction_log import CorrectionLogStore
-
-GROQ_PROVIDER = "groq"
-GEMINI_PROVIDER = "gemini"
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
 # Placeholder credentials for the mocked provider calls. They are not real keys
 # and never leave the process.
-GROQ_TEST_KEY = "test-groq-key-not-real"
-GEMINI_TEST_KEY = "test-gemini-key-not-real"
+SLOT_1_KEY = "test-slot-1-key-not-real"
+SLOT_2_KEY = "test-slot-2-key-not-real"
 
-# URL fragments that identify each provider's endpoint, so a test can answer or
-# inspect Groq and Gemini traffic independently.
-GROQ_URL_MARKER = "api.groq.com"
-GEMINI_URL_MARKER = "generativelanguage.googleapis.com"
+SLOT_1_BASE_URL = "https://slot-one.test/v1"
+SLOT_2_BASE_URL = "https://slot-two.test/v1"
 
-PROVIDER_URL_MARKERS = (GROQ_URL_MARKER, GEMINI_URL_MARKER)
+SLOT_1_MODEL = "stub-slot-1-model"
+SLOT_2_MODEL = "stub-slot-2-model"
+
+# URL fragments that identify each slot's endpoint, so a test can answer or
+# inspect the traffic of one slot independently.
+SLOT_1_URL_MARKER = "slot-one.test"
+SLOT_2_URL_MARKER = "slot-two.test"
+
+# Every variable that belongs to a provider-slot group, whatever its index.
+_SLOT_VARIABLE_PATTERN = re.compile(
+    r"^(API_KEY|BASE_URL|MODEL|TIMEOUT_SECONDS|EXTRA_BODY|NAME)_\d+$"
+)
 
 
 class StubCorrectionService:
@@ -52,7 +64,7 @@ class StubCorrectionService:
         self,
         result: str | None = None,
         error: Exception | None = None,
-        provider: str = GROQ_PROVIDER,
+        provider: str = "slot-1",
         model: str = "stub-model",
     ) -> None:
         self.result = result
@@ -105,13 +117,13 @@ def tolerant_client(stub_service: StubCorrectionService) -> Iterator[TestClient]
 
 
 class ProviderTransport:
-    """Mock provider transport that records the requests the adapters send.
+    """Mock provider transport that records the requests the adapter sends.
 
     One default handler answers every request; ``respond_for`` installs a
     handler for the requests whose URL contains a given marker, which lets a
-    test drive Groq and Gemini independently (needed by the fallback tests).
-    The recorded ``requests`` list gives tests access to the URL, headers, and
-    body each adapter actually produced.
+    test drive each slot independently (needed by the fallback tests). The
+    recorded ``requests`` list gives tests access to the URL, headers, and body
+    the adapter actually produced.
     """
 
     def __init__(self) -> None:
@@ -155,8 +167,8 @@ class ProviderTransport:
 def provider_transport(monkeypatch: pytest.MonkeyPatch) -> ProviderTransport:
     """Route provider HTTP through a mock transport (no network, no real key).
 
-    The adapters build their own ``httpx.AsyncClient`` when a request is made,
-    so patching the client class is what lets the real adapter code — endpoint,
+    The adapter builds its own ``httpx.AsyncClient`` when a request is made, so
+    patching the client class is what lets the real adapter code — endpoint,
     headers, payload, timeout, and error mapping — run without external calls.
     """
     transport = ProviderTransport()
@@ -178,6 +190,73 @@ def provider_client(provider_transport: ProviderTransport) -> Iterator[TestClien
         yield test_client
 
 
+def define_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    index: int,
+    *,
+    base_url: str,
+    api_key: str | None = None,
+    model: str | None = None,
+    timeout_seconds: str | None = None,
+    extra_body: str | None = None,
+    name: str | None = None,
+) -> None:
+    """Declare one provider slot through the process environment."""
+    key = api_key if api_key is not None else f"test-slot-{index}-key-not-real"
+    monkeypatch.setenv(f"API_KEY_{index}", key)
+    monkeypatch.setenv(f"BASE_URL_{index}", base_url)
+    monkeypatch.setenv(f"MODEL_{index}", model if model is not None else f"stub-slot-{index}-model")
+
+    for variable, value in (
+        ("TIMEOUT_SECONDS", timeout_seconds),
+        ("EXTRA_BODY", extra_body),
+        ("NAME", name),
+    ):
+        if value is not None:
+            monkeypatch.setenv(f"{variable}_{index}", value)
+
+
+@pytest.fixture
+def provider_slots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two complete slots with placeholder keys, and no other slot anywhere.
+
+    The real `.env` files are ignored for the duration of the test, so the suite
+    never depends on (or reveals) the deployment's configuration.
+    """
+    monkeypatch.setattr(app_config, "_ENV_FILES", ())
+
+    for key in list(os.environ):
+        if _SLOT_VARIABLE_PATTERN.match(key.upper()):
+            monkeypatch.delenv(key, raising=False)
+
+    define_slot(
+        monkeypatch,
+        1,
+        base_url=SLOT_1_BASE_URL,
+        api_key=SLOT_1_KEY,
+        model=SLOT_1_MODEL,
+    )
+    define_slot(
+        monkeypatch,
+        2,
+        base_url=SLOT_2_BASE_URL,
+        api_key=SLOT_2_KEY,
+        model=SLOT_2_MODEL,
+    )
+
+
+@pytest.fixture(autouse=True)
+def reset_slot_cooldowns() -> Iterator[None]:
+    """Start every test with no slot cooling down (the store is per process)."""
+    from app.services import correction as correction_module
+
+    correction_module._cooldowns.reset()
+
+    yield
+
+    correction_module._cooldowns.reset()
+
+
 @pytest.fixture(autouse=True)
 def correction_log_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point the evaluation log at a temporary file (never the real logs/).
@@ -193,22 +272,16 @@ def correction_log_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     return path
 
 
-@pytest.fixture
-def provider_keys(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give both providers placeholder keys without touching any real secret."""
-    monkeypatch.setattr(settings, "groq_api_key", SecretStr(GROQ_TEST_KEY))
-    monkeypatch.setattr(settings, "gemini_api_key", SecretStr(GEMINI_TEST_KEY))
-
-
 # --- Shared provider response builders -------------------------------------- #
-# One definition per provider payload shape, used by the service and fallback
-# tests so the mocked wire format cannot drift between test modules.
+# One definition of the OpenAI-compatible wire format, used by the adapter,
+# service, and fallback tests so the mocked shape cannot drift between modules.
 
 
-def groq_body(text: str) -> dict[str, object]:
-    """A successful Groq chat-completions payload carrying ``text``."""
+def chat_completion_body(text: str) -> dict[str, object]:
+    """A successful chat-completions payload carrying ``text``."""
     return {
         "id": "chatcmpl-test",
+        "object": "chat.completion",
         "choices": [
             {
                 "index": 0,
@@ -219,40 +292,22 @@ def groq_body(text: str) -> dict[str, object]:
     }
 
 
-def gemini_body(text: str) -> dict[str, object]:
-    """A successful Gemini ``generateContent`` payload carrying ``text``."""
-    return {
-        "candidates": [
-            {
-                "content": {"role": "model", "parts": [{"text": text}]},
-                "finishReason": "STOP",
-                "index": 0,
+def chat_completion_response(text: str) -> httpx.Response:
+    """200 response with a chat-completions success body."""
+    return httpx.Response(200, json=chat_completion_body(text))
+
+
+def chat_completion_error(
+    status_code: int, *, message: str = "provider detail"
+) -> httpx.Response:
+    """Error response; ``message`` stands in for echoed provider detail."""
+    return httpx.Response(
+        status_code,
+        json={
+            "error": {
+                "message": message,
+                "type": "provider_error",
+                "code": status_code,
             }
-        ]
-    }
-
-
-def groq_response(text: str) -> httpx.Response:
-    """200 response with a Groq success body."""
-    return httpx.Response(200, json=groq_body(text))
-
-
-def gemini_response(text: str) -> httpx.Response:
-    """200 response with a Gemini success body."""
-    return httpx.Response(200, json=gemini_body(text))
-
-
-def groq_error(status_code: int, *, message: str = "provider detail") -> httpx.Response:
-    """Groq error response; ``message`` stands in for echoed provider detail."""
-    return httpx.Response(
-        status_code,
-        json={"error": {"message": message, "type": "provider_error", "code": status_code}},
-    )
-
-
-def gemini_error(status_code: int, *, message: str = "provider detail") -> httpx.Response:
-    """Gemini error response; ``message`` stands in for echoed provider detail."""
-    return httpx.Response(
-        status_code,
-        json={"error": {"code": status_code, "message": message, "status": "UNAVAILABLE"}},
+        },
     )
