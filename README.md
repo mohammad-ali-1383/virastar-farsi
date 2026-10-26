@@ -4,8 +4,8 @@ AI-powered Persian proofreading service (spelling, grammar, punctuation, spacing
 typography) that preserves the author's meaning and tone.
 
 **Current status:** Phases 3 and 4 — the backend exposes `POST /api/v1/correct` (validation and the
-documented response/error formats) behind two provider adapters, **Groq** as the primary and
-**Google Gemini** as the automatic fallback, and the Persian RTL website calls that endpoint. See
+documented response/error formats) behind an ordered list of OpenAI-compatible provider slots
+configured in `.env`, and the Persian RTL website calls that endpoint. See
 `context/current-task.md`.
 
 ## Project structure
@@ -19,7 +19,7 @@ documented response/error formats) behind two provider adapters, **Groq** as the
 │   │   ├── schemas.py       # request/response models
 │   │   ├── main.py          # FastAPI app (health + correction router)
 │   │   ├── routers/         # HTTP endpoints
-│   │   └── services/        # correction service, prompt, and the Groq/Gemini adapters
+│   │   └── services/        # correction service, prompt, and the provider adapter
 │   ├── tests/               # pytest suite (provider calls are stubbed)
 │   ├── Dockerfile
 │   ├── requirements.txt     # runtime dependencies (pinned)
@@ -129,13 +129,17 @@ The text is validated in the backend; the maximum length comes from `MAX_TEXT_LE
 (default `1000`). The backend sends the fixed proofreading prompt to the provider as its system
 instruction, sends the user's text as a separate input, and returns the model's corrected text.
 
-**Provider order:** Groq is always tried first. When it fails for a provider-related reason —
-quota or rate limit, authentication/configuration error, timeout, connection failure, server
-error, or an invalid/empty response — the same request is retried once with Gemini, and Gemini's
-correction is returned. Invalid input and text over the length limit are rejected before either
-provider is called. There is no other retry, and text is never fabricated: when both providers
-fail the endpoint answers `503 PROVIDER_UNAVAILABLE` with a generic message. The browser never
-learns which provider is active.
+**Provider order:** the configured slots are tried in ascending numeric order (`1`, `2`, `3`, ...).
+When a slot fails for a provider-related reason — authentication, payment, quota or rate limit, a
+missing model, a server error, a timeout, a connection/DNS/TLS failure, or an empty/invalid
+response — the same request is sent to the next configured slot, and the first usable correction
+is returned. The whole chain has a 60-second budget (below the Nginx proxy timeout): each attempt
+is capped to the time that is left and no slot starts with less than 5 seconds remaining. A slot
+that answered `401`/`402`/`403` is skipped for 300 seconds and one that answered `429` for 30
+seconds, in memory per process. Invalid input and text over the length limit are rejected before
+any provider is called. There is no retry on the same slot, and text is never fabricated: when
+every slot fails or none is configured, the endpoint answers `503 PROVIDER_UNAVAILABLE` with a
+generic message. The browser never learns which provider is active.
 
 ## Validation
 
@@ -158,12 +162,12 @@ All tests mock the providers: no API key is needed and no request leaves the mac
 | `APP_ENV` | backend | `development` | Runtime environment label (read into settings; changes no behavior) |
 | `MAX_TEXT_LENGTH` | backend | `1000` | Maximum accepted text length |
 | `CORS_ORIGINS` | backend | dev origins | JSON array of allowed browser origins |
-| `GROQ_API_KEY` | backend | *(empty)* | Groq API key (secret); Groq is always tried first |
-| `GROQ_MODEL` | backend | `openai/gpt-oss-20b` | Groq model ID |
-| `GROQ_TIMEOUT_SECONDS` | backend | `30` | Per-request Groq timeout |
-| `GEMINI_API_KEY` | backend | *(empty)* | Gemini API key (secret); used when Groq fails |
-| `GEMINI_MODEL` | backend | `gemini-3.5-flash-lite` | Gemini model ID |
-| `GEMINI_TIMEOUT_SECONDS` | backend | `30` | Per-request Gemini timeout |
+| `API_KEY_N` | backend | *(empty)* | Secret key of provider slot N (`N` = 1, 2, 3, ...) |
+| `BASE_URL_N` | backend | *(empty)* | Base URL of slot N; `/chat/completions` is appended |
+| `MODEL_N` | backend | *(empty)* | Model ID sent to slot N |
+| `TIMEOUT_SECONDS_N` | backend | `20` | Per-request timeout for slot N |
+| `EXTRA_BODY_N` | backend | *(empty)* | Optional JSON object merged into slot N's request body |
+| `NAME_N` | backend | `slot-N` | Label of slot N in the logs and the evaluation log |
 | `CORRECTION_LOG_PATH` | backend | `<repo root>/logs/corrections.jsonl` | Consented evaluation log (JSON Lines) |
 | `VITE_API_BASE_URL` | frontend | `http://localhost:8000` | Backend base URL used by the browser |
 
@@ -172,10 +176,11 @@ All tests mock the providers: no API key is needed and no request leaves the mac
 requests while the page still blocks input at 1000 characters; the server remains the authority.
 
 Secrets live only in backend environment variables. Never place credentials in frontend
-code or in `.env` files that are committed. Each key is sent to its own provider in a request header
-— Groq in `Authorization: Bearer`, Gemini in `x-goog-api-key` (never the URL) — and is never
-logged or returned. Only the key of the provider being called is sent; the other key is never
-used. With the fallback in place, set both keys so a Groq outage does not become a service outage.
+code or in `.env` files that are committed. Each slot's key is sent only to that slot, as
+`Authorization: Bearer <key>` (never in the URL), and is never logged or returned. Only the key of
+the slot being called is sent; no other slot's key is ever used. Configure at least one complete
+slot (`API_KEY_N`, `BASE_URL_N`, `MODEL_N`), and preferably two or more, so a single provider
+outage does not become a service outage.
 
 ## Evaluation log (optional)
 
@@ -184,11 +189,12 @@ the backend appends one JSON Lines row per successful correction to `CORRECTION_
 (default `<repo root>/logs/corrections.jsonl`):
 
 ```json
-{"timestamp":"2026-10-16T12:30:00+00:00","original_text":"...","provider":"gemini","model":"gemini-3.5-flash-lite","corrected_text":"..."}
+{"timestamp":"2026-10-16T12:30:00+00:00","original_text":"...","provider":"slot-2","model":"some-vendor/model","corrected_text":"..."}
 ```
 
-`provider`/`model` name the provider that **actually succeeded**, so a Groq-to-Gemini fallback is
-recorded as Gemini. Declined requests store nothing and do not even create the file, and a failed
+`provider`/`model` name the provider slot that **actually succeeded** (its `NAME_N` label and
+`MODEL_N`), so a fallback to the second configured provider is recorded as `slot-2` unless that
+slot sets a `NAME_N`. Declined requests store nothing and do not even create the file, and a failed
 write never breaks or retries the request — it returns the correction and logs a sanitized warning.
 `logs/` is git-ignored. Docker Compose sets `CORRECTION_LOG_PATH=/app/logs/corrections.jsonl` and
 mounts `./logs`, so records survive a container recreate; delete `logs/corrections.jsonl` to clear
@@ -196,23 +202,30 @@ them.
 
 ## Local integration check (live provider)
 
-The automated tests mock both providers, need no key, and never make a real API call. No live
+The automated tests mock every provider, need no key, and never make a real API call. No live
 connection is verified until an actual API request succeeds.
 
-1. Get a key:
-   - Groq — https://console.groq.com/keys (primary)
-   - Google Gemini — https://aistudio.google.com/apikey (fallback)
-2. Put them in `<repo root>/.env` (git-ignored) — never in source, chat, or a committed file:
+1. Get an API key from any provider with an OpenAI-compatible `/chat/completions` endpoint — for
+example Z.ai (base URL `https://api.z.ai/api/paas/v4`) or GapGPT (`https://api.gapgpt.app/v1`).
+2. Put the slot variables in `<repo root>/.env` (git-ignored) — never in source, chat, or a
+committed file:
 
    ```bash
-   # Groq is always tried first.
-   GROQ_API_KEY=your-key-here
-   GROQ_MODEL=openai/gpt-oss-20b
+   # Slot 1: the provider tried first.
+   API_KEY_1=your-key-here
+   BASE_URL_1=https://api.z.ai/api/paas/v4
+   MODEL_1=<model-id-from-the-vendor>
+   NAME_1=zai
+   # Z.ai needs thinking disabled to return the proofread text directly:
+   EXTRA_BODY_1={"thinking":{"type":"disabled"}}
 
-   # Gemini is used automatically when Groq fails. With GEMINI_API_KEY empty, a
-   # Groq failure has no fallback and the request returns 503 PROVIDER_UNAVAILABLE.
-   GEMINI_API_KEY=your-key-here
-   GEMINI_MODEL=gemini-3.5-flash-lite
+   # Slot 2 (optional): used automatically when slot 1 fails. Without a complete
+   # slot 1 and slot 2, a failure has no fallback and the request returns
+   # 503 PROVIDER_UNAVAILABLE. For another vendor use the base URL from its docs.
+   API_KEY_2=your-key-here
+   BASE_URL_2=https://api.gapgpt.app/v1
+   MODEL_2=<model-id-from-the-vendor>
+   NAME_2=gapgpt
    ```
 
 3. Start the backend — pick one workflow:
@@ -241,28 +254,29 @@ connection is verified until an actual API request succeeds.
      -d '{"text": "سلام این یک متن ازمایشی است"}'
    ```
 
-   A corrected `{"corrected_text": "..."}` means the working key, model, and endpoint produced a
-   correction. Which provider answered is visible in the backend log, which names the providers and
-   the sanitized error codes only ("Provider groq failed (code=PROVIDER_RATE_LIMIT), falling back to
-   gemini"). `503 PROVIDER_UNAVAILABLE` means Groq failed and Gemini failed too (or is not
-   configured) — the endpoint never returns the text unchanged in that case.
+   A corrected `{"corrected_text": "..."}` means a configured slot's key, model, and endpoint
+   produced a correction. Which slot answered is visible in the backend log, which names slots and
+   sanitized error codes only ("Provider slot slot-1 failed (code=PROVIDER_RATE_LIMIT)", then
+   "Correction served by slot=slot-2"). `503 PROVIDER_UNAVAILABLE` means every configured slot
+   failed (or no slot is complete) — the endpoint never returns the text unchanged in that case.
 
-   To force the fallback deliberately, temporarily set a wrong `GROQ_API_KEY` (or an empty one) and
-   check that the request still returns a correction and that the log shows the Groq failure.
+   To force the fallback deliberately, temporarily set a wrong `API_KEY_1` and check that the
+   request still returns a correction from slot 2 and that the log shows the slot 1 failure.
 
-   Confirm the loaded configuration without exposing the keys:
+   Confirm the loaded slots (indexes, labels, and model IDs only — never a key):
 
    ```bash
    # Local
-   cd backend && python -c "from app.config import settings; print(settings.groq_model, settings.gemini_model, bool(settings.groq_api_key.get_secret_value()), bool(settings.gemini_api_key.get_secret_value()))"
+   cd backend && python -c "from app.config import load_provider_slots; print([(s.index, s.name, s.model) for s in load_provider_slots()])"
    # Compose
-   docker compose exec backend python -c "from app.config import settings; print(settings.groq_model, settings.gemini_model, bool(settings.groq_api_key.get_secret_value()), bool(settings.gemini_api_key.get_secret_value()))"
+   docker compose exec backend python -c "from app.config import load_provider_slots; print([(s.index, s.name, s.model) for s in load_provider_slots()])"
    ```
 
-   Both print the two model IDs and `True` per configured key (never a key itself).
+   A complete slot appears in that list; an incomplete one is skipped with a startup warning that
+   names only its index and the missing variable.
 
 ## Roadmap
 
-Phase 2 adds `POST /api/v1/correct`, Phase 3 the Groq and Gemini provider adapters with the automatic
-Groq-to-Gemini fallback, and Phase 4 the website. V2/V3 add further providers and a Telegram bot.
+Phase 2 adds `POST /api/v1/correct`, Phase 3 the generic OpenAI-compatible provider slots with the
+ordered fallback chain, and Phase 4 the website. V2/V3 add further providers and a Telegram bot.
 See `context/task-plan.md`.

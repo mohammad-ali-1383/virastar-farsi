@@ -1,9 +1,10 @@
 """Tests for the optional, consent-based evaluation log.
 
 The endpoint enforces consent (`correction-logging.md`): a record is appended
-only when the request explicitly asks for it, it names the provider and model
-that actually produced the correction (including the Gemini fallback), and a
-failed write never breaks the correction and never leaks the text.
+only when the request explicitly asks for it, it names the provider slot and
+model that actually produced the correction (including a later slot of the
+fallback chain), and a failed write never breaks the correction and never leaks
+the text.
 
 All provider traffic is mocked and every log path is a temporary file, so these
 tests need no key, make no network request, and touch no real ``logs/`` file.
@@ -23,17 +24,17 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.errors import INVALID_INPUT, TEXT_TOO_LONG, ProviderAuthError
-from app.services.correction import GEMINI_PROVIDER, GROQ_PROVIDER
 from app.services.correction_log import CorrectionLogStore, record_line
 from tests.conftest import (
-    GEMINI_TEST_KEY,
-    GEMINI_URL_MARKER,
-    GROQ_TEST_KEY,
-    GROQ_URL_MARKER,
+    SLOT_1_KEY,
+    SLOT_1_URL_MARKER,
+    SLOT_2_KEY,
+    SLOT_2_MODEL,
+    SLOT_2_URL_MARKER,
     ProviderTransport,
     StubCorrectionService,
-    gemini_response,
-    groq_error,
+    chat_completion_error,
+    chat_completion_response,
 )
 
 CORRECT_URL = "/api/v1/correct"
@@ -102,8 +103,8 @@ def test_consented_request_appends_one_record(
     client: TestClient, stub_service: StubCorrectionService, correction_log_path: Path
 ) -> None:
     stub_service.result = CORRECTED_TEXT
-    stub_service.provider = GROQ_PROVIDER
-    stub_service.model = "openai/gpt-oss-20b"
+    stub_service.provider = "slot-1"
+    stub_service.model = "some-vendor/model"
 
     response = client.post(CORRECT_URL, json=_body(True))
 
@@ -114,8 +115,8 @@ def test_consented_request_appends_one_record(
     assert list(rows[0]) == RECORD_KEYS
     assert rows[0]["original_text"] == PERSIAN_TEXT
     assert rows[0]["corrected_text"] == CORRECTED_TEXT
-    assert rows[0]["provider"] == GROQ_PROVIDER
-    assert rows[0]["model"] == "openai/gpt-oss-20b"
+    assert rows[0]["provider"] == "slot-1"
+    assert rows[0]["model"] == "some-vendor/model"
 
 
 def test_record_timestamp_is_iso_8601_with_a_timezone(
@@ -146,29 +147,28 @@ def test_record_is_written_as_one_json_line_per_request(
 def test_consented_record_names_the_provider_that_succeeded(
     client: TestClient, stub_service: StubCorrectionService, correction_log_path: Path
 ) -> None:
-    stub_service.provider = GEMINI_PROVIDER
-    stub_service.model = "gemini-3.5-flash-lite"
+    stub_service.provider = "slot-2"
+    stub_service.model = "stub-slot-2-model"
 
     client.post(CORRECT_URL, json=_body(True))
 
     row = _rows(correction_log_path)[0]
-    assert row["provider"] == GEMINI_PROVIDER
-    assert row["model"] == "gemini-3.5-flash-lite"
+    assert row["provider"] == "slot-2"
+    assert row["model"] == "stub-slot-2-model"
 
 
-def test_fallback_success_is_logged_with_the_fallback_provider(
-    monkeypatch: pytest.MonkeyPatch,
+def test_fallback_success_is_logged_with_the_slot_that_answered(
     provider_transport: ProviderTransport,
     provider_client: TestClient,
-    provider_keys: None,
+    provider_slots: None,
     correction_log_path: Path,
 ) -> None:
-    # Real adapters: Groq is rate limited, so Gemini answers — and Gemini is
-    # what the record must name.
-    monkeypatch.setattr(settings, "groq_model", "openai/gpt-oss-20b")
-    monkeypatch.setattr(settings, "gemini_model", "gemini-test-model")
-    provider_transport.respond_for(GROQ_URL_MARKER, lambda _: groq_error(429))
-    provider_transport.respond_for(GEMINI_URL_MARKER, lambda _: gemini_response(CORRECTED_TEXT))
+    # Real adapter: slot 1 is rate limited, so slot 2 answers — and slot 2 is
+    # what the record must name, with its own model.
+    provider_transport.respond_for(SLOT_1_URL_MARKER, lambda _: chat_completion_error(429))
+    provider_transport.respond_for(
+        SLOT_2_URL_MARKER, lambda _: chat_completion_response(CORRECTED_TEXT)
+    )
 
     response = provider_client.post(CORRECT_URL, json=_body(True))
 
@@ -176,8 +176,8 @@ def test_fallback_success_is_logged_with_the_fallback_provider(
     assert response.json() == {"corrected_text": CORRECTED_TEXT}
     assert len(provider_transport.requests) == 2
     row = _rows(correction_log_path)[0]
-    assert row["provider"] == GEMINI_PROVIDER
-    assert row["model"] == "gemini-test-model"
+    assert row["provider"] == "slot-2"
+    assert row["model"] == SLOT_2_MODEL
     assert row["original_text"] == PERSIAN_TEXT
     assert row["corrected_text"] == CORRECTED_TEXT
 
@@ -309,8 +309,8 @@ def test_write_failure_still_returns_the_correction(
     assert "Could not append the consented evaluation record" in logged
     assert PERSIAN_TEXT not in logged
     assert CORRECTED_TEXT not in logged
-    assert GROQ_TEST_KEY not in logged
-    assert GEMINI_TEST_KEY not in logged
+    assert SLOT_1_KEY not in logged
+    assert SLOT_2_KEY not in logged
     assert "Traceback" not in logged
 
 
@@ -376,8 +376,8 @@ def test_record_line_serializes_the_documented_fields_with_persian_text() -> Non
     line = record_line(
         timestamp=stamp,
         original_text=PERSIAN_TEXT,
-        provider=GEMINI_PROVIDER,
-        model="gemini-test-model",
+        provider="slot-2",
+        model="stub-slot-2-model",
         corrected_text=CORRECTED_TEXT,
     )
 
@@ -395,8 +395,8 @@ def test_store_creates_missing_directories(tmp_path: Path) -> None:
     written = asyncio.run(
         store.append(
             original_text=PERSIAN_TEXT,
-            provider=GROQ_PROVIDER,
-            model="openai/gpt-oss-20b",
+            provider="slot-1",
+            model="some-vendor/model",
             corrected_text=CORRECTED_TEXT,
         )
     )
@@ -416,8 +416,8 @@ def test_store_returns_false_and_keeps_the_text_out_of_the_logs(
         written = asyncio.run(
             store.append(
                 original_text=PERSIAN_TEXT,
-                provider=GROQ_PROVIDER,
-                model="openai/gpt-oss-20b",
+                provider="slot-1",
+                model="some-vendor/model",
                 corrected_text=CORRECTED_TEXT,
             )
         )
@@ -429,31 +429,36 @@ def test_store_returns_false_and_keeps_the_text_out_of_the_logs(
     assert CORRECTED_TEXT not in logged
 
 
-def test_openai_style_and_gemini_bodies_are_never_logged(
+def test_provider_bodies_are_never_logged(
     caplog: pytest.LogCaptureFixture,
     provider_transport: ProviderTransport,
     provider_client: TestClient,
-    provider_keys: None,
+    provider_slots: None,
     correction_log_path: Path,
 ) -> None:
     # A provider failure whose body echoes request material must not reach the
     # application log when the request also consented to logging.
     provider_transport.respond_for(
-        GROQ_URL_MARKER,
+        SLOT_1_URL_MARKER,
         lambda _: httpx.Response(
             503,
-            json={"error": {"message": f"overloaded for key {GROQ_TEST_KEY}", "type": "server_error"}},
+            json={"error": {
+                "message": f"overloaded for key {SLOT_1_KEY}",
+                "type": "server_error",
+            }},
         ),
     )
-    provider_transport.respond_for(GEMINI_URL_MARKER, lambda _: gemini_response(CORRECTED_TEXT))
+    provider_transport.respond_for(
+        SLOT_2_URL_MARKER, lambda _: chat_completion_response(CORRECTED_TEXT)
+    )
 
     with caplog.at_level(logging.DEBUG):
         response = provider_client.post(CORRECT_URL, json=_body(True))
 
     logged = "\n".join(record.getMessage() for record in caplog.records)
     assert response.status_code == 200
-    assert GROQ_TEST_KEY not in logged
-    assert GROQ_TEST_KEY not in response.text
+    assert SLOT_1_KEY not in logged
+    assert SLOT_1_KEY not in response.text
     assert "overloaded for key" not in logged
     # The consented record stores the text on purpose; the *logs* stay clean.
     assert CORRECTED_TEXT not in logged

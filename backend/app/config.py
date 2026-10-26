@@ -1,7 +1,17 @@
 """Application configuration loaded from environment variables."""
 
-from pathlib import Path
+from __future__ import annotations
 
+import json
+import logging
+import os
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from dotenv import dotenv_values
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +26,8 @@ _REPO_ROOT = _BACKEND_DIR.parent
 # location for both Docker Compose and local runs. ``backend/.env`` is still
 # honored for backward compatibility and, being listed second, takes precedence.
 _ENV_FILES = (_REPO_ROOT / ".env", _BACKEND_DIR / ".env")
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -50,34 +62,15 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
     ]
 
-    # --- Providers (`tech-stack.md`) ---
-    # The order is fixed in code, not configuration: the correction service
-    # always tries Groq first and falls back to Gemini when Groq fails for a
-    # provider-related reason (see `correction.py`). There is deliberately no
-    # provider-selection setting, so only the two blocks below are configurable.
-
-    # --- Groq (primary; OpenAI-compatible Chat Completions API) ---
-    # Secret: read from the environment only and never logged or returned.
-    # ``SecretStr`` keeps the value out of reprs, tracebacks, and logs.
-    groq_api_key: SecretStr = SecretStr("")
-
-    # Model ID served by Groq; overridable so a model change needs no code
-    # change (`api-contract.md` -> Compatibility).
-    groq_model: str = "openai/gpt-oss-20b"
-
-    # Per-request provider timeout (`architecture.md`, section 3: configuration
-    # owns model settings, endpoints, and timeouts).
-    groq_timeout_seconds: float = 30.0
-
-    # --- Google Gemini (fallback provider; generateContent API) ---
-    # Secret, handled exactly like the Groq key above.
-    gemini_api_key: SecretStr = SecretStr("")
-
-    # Model ID served by Gemini; overridable without a code change.
-    gemini_model: str = "gemini-3.5-flash-lite"
-
-    # Per-request provider timeout, independent of the Groq one.
-    gemini_timeout_seconds: float = 30.0
+    # --- Provider slots -----------------------------------------------------
+    # The LLM provider layer is an ordered list of OpenAI-compatible "slots"
+    # configured purely through the environment (`tech-stack.md`). For every
+    # integer N >= 1 a slot may be defined with API_KEY_N (secret), BASE_URL_N
+    # and MODEL_N, plus the optional TIMEOUT_SECONDS_N, EXTRA_BODY_N and NAME_N.
+    # No vendor is special and the number of slots is not limited, so the slots
+    # are not fields of this model: `load_provider_slots` below discovers them
+    # dynamically. This model ignores those variables (``extra="ignore"``) while
+    # still validating every setting it owns.
 
 
 settings = Settings()
@@ -90,3 +83,189 @@ def get_max_text_length() -> int:
     variable or `.env`) takes effect without recreating the application.
     """
     return settings.max_text_length
+
+
+# --- Provider slot discovery ------------------------------------------------ #
+# A slot is a numbered group of variables. Only ``API_KEY_<N>`` decides whether
+# an index exists; the other variables of a group are then validated together.
+_SLOT_KEY_PATTERN = re.compile(r"^API_KEY_([1-9]\d*)$")
+
+DEFAULT_SLOT_TIMEOUT_SECONDS = 20.0
+DEFAULT_SLOT_NAME_PREFIX = "slot-"
+
+
+@dataclass(frozen=True)
+class ProviderSlotConfig:
+    """One fully configured provider slot, as read from the environment."""
+
+    index: int
+    name: str
+    base_url: str
+    model: str
+    api_key: SecretStr
+    timeout_seconds: float = DEFAULT_SLOT_TIMEOUT_SECONDS
+    extra_body: dict[str, Any] | None = None
+
+
+def _clean(raw: str | None) -> str:
+    """Trim surrounding whitespace and the carriage returns of CRLF `.env` files."""
+    if not raw:
+        return ""
+    return raw.replace("\r", "").strip()
+
+
+def _read_env_files() -> dict[str, str]:
+    """Values from the documented `.env` locations, later file winning.
+
+    ``python-dotenv`` is used directly (it is already a dependency of
+    ``pydantic-settings``) because slot names are discovered dynamically and
+    therefore cannot be declared as model fields.
+    """
+    values: dict[str, str] = {}
+
+    for env_file in _ENV_FILES:
+        path = Path(env_file)
+        if not path.is_file():
+            continue
+        for key, value in dotenv_values(path).items():
+            if value is not None:
+                values[key.upper()] = value
+
+    return values
+
+
+def _env_values() -> dict[str, str]:
+    """All slot variables: `.env` files first, the process environment on top.
+
+    Docker passes the same file through ``env_file``, so a container sees these
+    values in the process environment; a local Uvicorn run sees them in `.env`.
+    Real environment variables always win on conflicts.
+    """
+    values = _read_env_files()
+    values.update({key.upper(): value for key, value in os.environ.items()})
+    return values
+
+
+def _extra_body(index: int, raw: str) -> dict[str, Any] | None:
+    """Parse ``EXTRA_BODY_N`` as a JSON object, ignoring anything else.
+
+    A value wrapped in single or double quotes (as a shell or `docker --env`
+    argument often is) is unwrapped first. The raw value is never logged because
+    it belongs to provider configuration.
+    """
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        logger.warning(
+            "Provider slot %d: EXTRA_BODY_%d is not valid JSON and was ignored",
+            index,
+            index,
+        )
+        return None
+
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "Provider slot %d: EXTRA_BODY_%d is not a JSON object and was ignored",
+            index,
+            index,
+        )
+        return None
+
+    return parsed
+
+
+def _timeout_seconds(index: int, raw: str) -> float:
+    """Per-slot timeout, defaulting to 20 seconds when absent or unusable."""
+    if not raw:
+        return DEFAULT_SLOT_TIMEOUT_SECONDS
+
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+
+    if value <= 0:
+        logger.warning(
+            "Provider slot %d: TIMEOUT_SECONDS_%d is unusable; using the default",
+            index,
+            index,
+        )
+        return DEFAULT_SLOT_TIMEOUT_SECONDS
+
+    return value
+
+
+def _build_slot(index: int, values: Mapping[str, str]) -> ProviderSlotConfig | None:
+    """Build one slot, or ``None`` when it is incomplete (skipped with a warning).
+
+    Only the index and the name of the missing variable are logged; the values,
+    and in particular the key, never reach the logs.
+    """
+    api_key = _clean(values.get(f"API_KEY_{index}"))
+    base_url = _clean(values.get(f"BASE_URL_{index}"))
+    model = _clean(values.get(f"MODEL_{index}"))
+
+    missing = [
+        f"{field}_{index}"
+        for field, value in (
+            ("API_KEY", api_key),
+            ("BASE_URL", base_url),
+            ("MODEL", model),
+        )
+        if not value
+    ]
+
+    if missing:
+        logger.warning(
+            "Provider slot %d is incomplete and will be skipped (missing %s)",
+            index,
+            ", ".join(missing),
+        )
+        return None
+
+    name = _clean(values.get(f"NAME_{index}")) or f"{DEFAULT_SLOT_NAME_PREFIX}{index}"
+    raw_extra_body = values.get(f"EXTRA_BODY_{index}") or ""
+    extra_body = _extra_body(index, raw_extra_body) if raw_extra_body.strip() else None
+
+    return ProviderSlotConfig(
+        index=index,
+        name=name,
+        base_url=base_url,
+        model=model,
+        api_key=SecretStr(api_key),
+        timeout_seconds=_timeout_seconds(
+            index, _clean(values.get(f"TIMEOUT_SECONDS_{index}"))
+        ),
+        extra_body=extra_body,
+    )
+
+
+def load_provider_slots(env: Mapping[str, str] | None = None) -> list[ProviderSlotConfig]:
+    """Discover the configured provider slots, ordered by their numeric index.
+
+    Indexes may have gaps. When ``env`` is given it is used instead of the
+    process environment and the `.env` files (tests), which keeps the discovery
+    rule identical without depending on the machine's configuration.
+    """
+    if env is None:
+        values = _env_values()
+    else:
+        values = {key.strip().upper(): value for key, value in env.items()}
+
+    indexes = sorted(
+        {
+            int(match.group(1))
+            for key in values
+            if (match := _SLOT_KEY_PATTERN.match(key))
+        }
+    )
+
+    return [
+        slot
+        for index in indexes
+        if (slot := _build_slot(index, values)) is not None
+    ]

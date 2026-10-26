@@ -45,5 +45,8 @@ Thumbs.db
 *.log
 tmp/
 
+# Local live provider check (operator tool, never committed)
+/scripts/check_providers.py
+
 # Consented evaluation logs (may contain user text). Never commit them.
 logs/

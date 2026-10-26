@@ -1,14 +1,14 @@
-"""Tests for the correction service: Groq first, Gemini as the fallback.
+"""Tests for the correction service: an ordered chain of provider slots.
 
 The service-level tests use provider doubles; the end-to-end tests drive the
-real adapters through ``httpx.MockTransport`` (installed by the
+real adapter through ``httpx.MockTransport`` (installed by the
 ``provider_transport`` fixture) and the same FastAPI dependency the app uses, so
 the real HTTP layer, validation, prompt handling, and error handlers are covered
 without a real API key or network access.
 
-The fallback failure matrix through ``POST /api/v1/correct`` — quota, timeout,
-connection, server error, invalid provider output, and the both-providers-fail
-case — lives in ``tests/test_provider_fallback.py``.
+The fallback failure matrix through ``POST /api/v1/correct`` — 401/402/403/404,
+rate limit, server error, timeout, connection error, empty content, and the
+all-slots-fail case — lives in ``tests/test_provider_fallback.py``.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import settings
 from app.errors import (
     PROVIDER_UNAVAILABLE,
     ProviderAuthError,
@@ -28,8 +27,6 @@ from app.errors import (
     ProviderUnavailableError,
 )
 from app.services.correction import (
-    GEMINI_PROVIDER,
-    GROQ_PROVIDER,
     CorrectionResult,
     LLMCorrectionService,
     LLMProvider,
@@ -38,19 +35,19 @@ from app.services.correction import (
 )
 from app.services.prompt import PERSIAN_PROOFREADING_SYSTEM_PROMPT
 from tests.conftest import (
-    GROQ_TEST_KEY,
-    GROQ_URL_MARKER,
+    SLOT_1_KEY,
+    SLOT_1_MODEL,
+    SLOT_1_URL_MARKER,
     ProviderTransport,
-    groq_response,
+    chat_completion_response,
 )
 
 CORRECT_URL = "/api/v1/correct"
 PERSIAN_TEXT = "سلام این یک متن ازمایشی است"
 CORRECTED_TEXT = "سلام، این یک متن آزمایشی است."
 
-# Stand-in model IDs: the service reports the model of the adapter it used.
-GROQ_MODEL = "stub-groq-model"
-GEMINI_MODEL = "stub-gemini-model"
+# Stand-in model ID: the service reports the model of the slot it used.
+SLOT_1_TEST_MODEL = SLOT_1_MODEL
 
 
 class _RecordingProvider:
@@ -59,20 +56,30 @@ class _RecordingProvider:
     def __init__(self, result: str = "corrected", error: Exception | None = None) -> None:
         self._result = result
         self._error = error
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, float | None]] = []
 
-    async def generate(self, *, system_instruction: str, user_text: str) -> str:
-        self.calls.append((system_instruction, user_text))
+    async def generate(
+        self,
+        *,
+        system_instruction: str,
+        user_text: str,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        self.calls.append((system_instruction, user_text, timeout_seconds))
         if self._error is not None:
             raise self._error
         return self._result
 
 
-def _service(primary: LLMProvider, fallback: LLMProvider) -> LLMCorrectionService:
-    """The production chain: Groq as the primary, Gemini as the fallback."""
+def _service(*providers: LLMProvider) -> LLMCorrectionService:
+    """The production shape: one slot per provider, in order."""
     return LLMCorrectionService(
-        primary=ProviderSlot(GROQ_PROVIDER, GROQ_MODEL, primary),
-        fallback=ProviderSlot(GEMINI_PROVIDER, GEMINI_MODEL, fallback),
+        [
+            ProviderSlot(
+                f"slot-{index}", f"model-{index}", provider
+            )
+            for index, provider in enumerate(providers, start=1)
+        ]
     )
 
 
@@ -84,86 +91,106 @@ def _correct(service: LLMCorrectionService, text: str = PERSIAN_TEXT) -> Correct
 
 
 def test_service_sends_the_prompt_and_user_text_separately() -> None:
-    primary = _RecordingProvider(result="متن اصلاح‌شده")
-    fallback = _RecordingProvider(result="unused")
+    first = _RecordingProvider(result="متن اصلاح‌شده")
+    second = _RecordingProvider(result="unused")
 
-    result = _correct(_service(primary, fallback))
+    result = _correct(_service(first, second))
 
     assert result.text == "متن اصلاح‌شده"
-    assert primary.calls == [(PERSIAN_PROOFREADING_SYSTEM_PROMPT, PERSIAN_TEXT)]
-    # A successful primary means the fallback is never touched.
-    assert fallback.calls == []
+    assert [(prompt, text) for prompt, text, _ in first.calls] == [
+        (PERSIAN_PROOFREADING_SYSTEM_PROMPT, PERSIAN_TEXT)
+    ]
+    # A successful first slot means the second one is never touched.
+    assert second.calls == []
 
 
-def test_result_names_the_provider_and_model_that_succeeded() -> None:
+def test_result_names_the_slot_and_model_that_succeeded() -> None:
     result = _correct(_service(_RecordingProvider(result="ok"), _RecordingProvider()))
 
-    # What the evaluation log records: the adapter that produced the text and
-    # the model ID it sends.
-    assert (result.provider, result.model) == (GROQ_PROVIDER, GROQ_MODEL)
+    # What the evaluation log records: the slot that produced the text and the
+    # model ID it sends.
+    assert (result.provider, result.model) == ("slot-1", "model-1")
 
 
-def test_fallback_returns_its_own_result_when_the_primary_fails() -> None:
-    primary = _RecordingProvider(error=ProviderAuthError("no key"))
-    fallback = _RecordingProvider(result="اصلاح‌شده با گیمینی")
+def test_fallback_returns_its_own_result_when_the_first_slot_fails() -> None:
+    first = _RecordingProvider(error=ProviderAuthError("no key"))
+    second = _RecordingProvider(result="اصلاح‌شده با اسلات دوم")
 
-    result = _correct(_service(primary, fallback))
+    result = _correct(_service(first, second))
 
-    assert result.text == "اصلاح‌شده با گیمینی"
-    # The fallback that actually ran is the one reported, with its own model.
-    assert (result.provider, result.model) == (GEMINI_PROVIDER, GEMINI_MODEL)
+    assert result.text == "اصلاح‌شده با اسلات دوم"
+    # The slot that actually ran is the one reported, with its own model.
+    assert (result.provider, result.model) == ("slot-2", "model-2")
 
 
 def test_fallback_receives_the_same_prompt_and_user_text() -> None:
-    primary = _RecordingProvider(error=ProviderTimeoutError("timed out"))
-    fallback = _RecordingProvider(result="ok")
+    first = _RecordingProvider(error=ProviderTimeoutError("timed out"))
+    second = _RecordingProvider(result="ok")
 
-    _correct(_service(primary, fallback), text="متن کاربر برای اصلاح")
+    _correct(_service(first, second), text="متن کاربر برای اصلاح")
 
-    # Same request, other provider: the fallback cannot change what is asked.
-    assert fallback.calls == [(PERSIAN_PROOFREADING_SYSTEM_PROMPT, "متن کاربر برای اصلاح")]
+    # Same request, other slot: a fallback cannot change what is asked.
+    assert [(prompt, text) for prompt, text, _ in second.calls] == [
+        (PERSIAN_PROOFREADING_SYSTEM_PROMPT, "متن کاربر برای اصلاح")
+    ]
 
 
-def test_each_provider_is_attempted_at_most_once() -> None:
-    primary = _RecordingProvider(error=ProviderUnavailableError("down"))
-    fallback = _RecordingProvider(error=ProviderUnavailableError("down"))
+def test_each_slot_is_attempted_at_most_once() -> None:
+    first = _RecordingProvider(error=ProviderUnavailableError("down"))
+    second = _RecordingProvider(error=ProviderUnavailableError("down"))
 
     with pytest.raises(ProviderUnavailableError):
-        _correct(_service(primary, fallback))
+        _correct(_service(first, second))
 
-    # One attempt per provider: no retry loop, no duplicate request.
-    assert len(primary.calls) == 1
-    assert len(fallback.calls) == 1
+    # One attempt per slot: no retry loop, no duplicate request.
+    assert len(first.calls) == 1
+    assert len(second.calls) == 1
 
 
-def test_both_providers_failing_raise_one_safe_error() -> None:
-    primary = _RecordingProvider(error=ProviderAuthError("GROQ_API_KEY is not configured"))
-    fallback = _RecordingProvider(error=ProviderAuthError("GEMINI_API_KEY is not configured"))
+def test_all_slots_failing_raise_one_safe_error() -> None:
+    first = _RecordingProvider(error=ProviderAuthError("slot-1 has no API key configured"))
+    second = _RecordingProvider(error=ProviderAuthError("slot-2 has no API key configured"))
 
     with pytest.raises(ProviderUnavailableError) as excinfo:
-        _correct(_service(primary, fallback))
+        _correct(_service(first, second))
 
     error = excinfo.value
     assert error.code == PROVIDER_UNAVAILABLE
     # The client-facing message is the documented generic one.
     assert "در دسترس نیست" in error.message
-    # Only provider names and public codes are recorded for the server log.
+    # Only slot names and public codes are recorded for the server log.
     assert error.detail is not None
-    assert GROQ_PROVIDER in error.detail
-    assert GEMINI_PROVIDER in error.detail
-    assert "GROQ_API_KEY" not in error.detail
-    assert "GEMINI_API_KEY" not in error.detail
+    assert "slot-1" in error.detail
+    assert "slot-2" in error.detail
+    assert "API key" not in error.detail
 
 
 def test_a_programming_error_is_not_masked_by_the_fallback() -> None:
-    primary = _RecordingProvider(error=RuntimeError("bug in our code"))
-    fallback = _RecordingProvider(result="should not be reached")
+    first = _RecordingProvider(error=RuntimeError("bug in our code"))
+    second = _RecordingProvider(result="should not be reached")
 
     with pytest.raises(RuntimeError):
-        _correct(_service(primary, fallback))
+        _correct(_service(first, second))
 
     # Only provider-related failures trigger the fallback.
-    assert fallback.calls == []
+    assert second.calls == []
+
+
+def test_no_configured_slot_is_the_documented_service_error() -> None:
+    with pytest.raises(ProviderUnavailableError) as excinfo:
+        _correct(LLMCorrectionService([]))
+
+    assert excinfo.value.code == PROVIDER_UNAVAILABLE
+
+
+def test_every_slot_is_given_the_overall_deadline_while_it_fits() -> None:
+    first = _RecordingProvider(result="ok")
+
+    _correct(_service(first))
+
+    # The chain passes the time it has left (the 60 second budget here).
+    assert first.calls[0][2] is not None
+    assert 0 < first.calls[0][2] <= 60
 
 
 # --- Dependency wiring ------------------------------------------------------
@@ -176,16 +203,16 @@ def test_dependency_builds_an_llm_backed_service() -> None:
 # --- End-to-end through POST /api/v1/correct --------------------------------
 
 
-def test_endpoint_returns_the_groq_correction(
+def test_endpoint_returns_the_correction(
     provider_transport: ProviderTransport,
     provider_client: TestClient,
-    provider_keys: None,
+    provider_slots: None,
 ) -> None:
     # The default handler answers every non-routed request with a 500, so only
-    # the Groq endpoint can produce a successful response.
+    # the first slot's endpoint can produce a successful response.
     provider_transport.respond(lambda _: httpx.Response(500))
     provider_transport.respond_for(
-        GROQ_URL_MARKER, lambda _: groq_response(CORRECTED_TEXT)
+        SLOT_1_URL_MARKER, lambda _: chat_completion_response(CORRECTED_TEXT)
     )
 
     response = provider_client.post(CORRECT_URL, json={"text": PERSIAN_TEXT})
@@ -194,24 +221,22 @@ def test_endpoint_returns_the_groq_correction(
     assert response.json() == {"corrected_text": CORRECTED_TEXT}
 
 
-def test_endpoint_sends_the_correction_prompt_to_groq(
-    monkeypatch: pytest.MonkeyPatch,
+def test_endpoint_sends_the_correction_prompt_and_only_that_slots_key(
     provider_transport: ProviderTransport,
     provider_client: TestClient,
-    provider_keys: None,
+    provider_slots: None,
 ) -> None:
-    monkeypatch.setattr(settings, "groq_model", "openai/gpt-oss-120b")
-    provider_transport.respond(lambda _: groq_response(CORRECTED_TEXT))
+    provider_transport.respond(lambda _: chat_completion_response(CORRECTED_TEXT))
 
     provider_client.post(CORRECT_URL, json={"text": "متن"})
 
     request = provider_transport.requests[0]
     body = json.loads(request.content)
-    assert body["model"] == "openai/gpt-oss-120b"
+    assert body["model"] == SLOT_1_TEST_MODEL
     assert body["messages"] == [
         {"role": "system", "content": PERSIAN_PROOFREADING_SYSTEM_PROMPT},
         {"role": "user", "content": "متن"},
     ]
-    # The key travels in the provider's header, never in the URL.
-    assert request.headers["Authorization"] == f"Bearer {GROQ_TEST_KEY}"
-    assert GROQ_TEST_KEY not in str(request.url)
+    # The key travels in the header, never in the URL, and only slot 1's key.
+    assert request.headers["Authorization"] == f"Bearer {SLOT_1_KEY}"
+    assert SLOT_1_KEY not in str(request.url)

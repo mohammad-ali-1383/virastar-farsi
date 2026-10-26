@@ -69,9 +69,9 @@ async def correct_text(
         raise InternalError("correction service returned empty text")
 
     # Consent decides everything: without an explicit opt-in neither text is
-    # written anywhere. The record names the provider that actually succeeded,
-    # which is the fallback provider after a Groq failure. A failed write is
-    # reported by the store itself (sanitized warning) and never fails or
+    # written anywhere. The record names the provider slot that actually
+    # succeeded, which is a later slot when earlier ones failed. A failed write
+    # is reported by the store itself (sanitized warning) and never fails or
     # retries the request.
     if payload.store_for_evaluation:
         await log_store.append(
