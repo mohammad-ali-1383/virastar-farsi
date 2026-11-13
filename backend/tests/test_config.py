@@ -401,3 +401,21 @@ def test_an_unusable_extra_body_is_ignored_without_printing_it(
     assert "EXTRA_BODY_1" in logged
     # Never the content of the value.
     assert raw_extra_body not in logged
+
+
+# --- Evaluation log ---------------------------------------------------------
+
+
+def test_default_correction_log_path_is_under_the_repository_root() -> None:
+    path = Settings(_env_file=None).correction_log_path
+
+    # CWD-independent, like the env-file lookup (MODEL-002), so both documented
+    # local workflows write the consented records to the same place.
+    assert path == _REPO_ROOT / "logs" / "corrections.jsonl"
+    assert path.is_absolute()
+
+
+def test_correction_log_path_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORRECTION_LOG_PATH", "custom/records.jsonl")
+
+    assert Settings(_env_file=None).correction_log_path == Path("custom/records.jsonl")

@@ -14,7 +14,6 @@ from fastapi.openapi.utils import get_openapi
 from app.config import settings
 from app.errors import register_exception_handlers
 from app.routers.correction import router as correction_router
-from app.routers.export_docx import router as export_docx_router
 
 app = FastAPI(
     title="Persian Writing Assistant API",
@@ -33,7 +32,6 @@ app.add_middleware(
 register_exception_handlers(app)
 
 app.include_router(correction_router)
-app.include_router(export_docx_router)
 
 
 def _openapi_schema() -> dict[str, Any]:
