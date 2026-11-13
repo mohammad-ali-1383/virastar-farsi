@@ -111,7 +111,7 @@ class OpenAICompatibleProvider:
 
     @property
     def name(self) -> str:
-        """The slot label used in the logs and in the evaluation log."""
+        """The slot label used in the logs and in the correction result."""
         return self._name
 
     @property
