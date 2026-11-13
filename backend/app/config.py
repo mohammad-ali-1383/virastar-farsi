@@ -49,13 +49,6 @@ class Settings(BaseSettings):
     # Maximum accepted text length. Configurable per `api-contract.md`.
     max_text_length: int = 1000
 
-    # Where consented correction records are appended, one JSON Lines row per
-    # successful correction (`correction-logging.md`). Anchored to the repository
-    # root like the env files, so the documented local workflows write to the
-    # same place; overridable for tests and deployments. Nothing is written
-    # unless a request opts in, and the directory is created on first use.
-    correction_log_path: Path = _REPO_ROOT / "logs" / "corrections.jsonl"
-
     # Development origins allowed by CORS (`architecture.md`, section 4).
     cors_origins: list[str] = [
         "http://localhost:5173",

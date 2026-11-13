@@ -29,7 +29,7 @@ from app.errors import (
     ProviderUnavailableError,
 )
 from app.services.openai_compatible import OpenAICompatibleProvider
-from app.services.prompt import PERSIAN_PROOFREADING_SYSTEM_PROMPT
+from app.services.prompt import PRESERVE_SYSTEM_PROMPT
 
 MODEL = "some-vendor/model"
 API_KEY = "unit-test-key-not-real"
@@ -84,7 +84,7 @@ def _generate(
 ) -> str:
     return asyncio.run(
         provider.generate(
-            system_instruction=PERSIAN_PROOFREADING_SYSTEM_PROMPT,
+            system_instruction=PRESERVE_SYSTEM_PROMPT,
             user_text=user_text,
             timeout_seconds=timeout_seconds,
         )
@@ -140,13 +140,13 @@ def test_prompt_and_user_text_are_sent_as_separate_messages() -> None:
     # The prompt is the system message; the user's text is a separate message.
     assert body["model"] == MODEL
     assert body["messages"] == [
-        {"role": "system", "content": PERSIAN_PROOFREADING_SYSTEM_PROMPT},
+        {"role": "system", "content": PRESERVE_SYSTEM_PROMPT},
         {"role": "user", "content": "متن کاربر برای اصلاح"},
     ]
     assert body["temperature"] == 0.2
     assert body["stream"] is False
     # The user's text must appear only in its own message, never in the prompt.
-    assert "متن کاربر برای اصلاح" not in PERSIAN_PROOFREADING_SYSTEM_PROMPT
+    assert "متن کاربر برای اصلاح" not in PRESERVE_SYSTEM_PROMPT
 
 
 def test_the_request_is_a_post_to_the_chat_completions_endpoint() -> None:
@@ -227,7 +227,7 @@ def test_extra_body_can_never_override_model_messages_or_stream() -> None:
     body = json.loads(captured[0].content)
     assert body["model"] == MODEL
     assert body["messages"] == [
-        {"role": "system", "content": PERSIAN_PROOFREADING_SYSTEM_PROMPT},
+        {"role": "system", "content": PRESERVE_SYSTEM_PROMPT},
         {"role": "user", "content": "متن کاربر"},
     ]
     assert body["stream"] is False
