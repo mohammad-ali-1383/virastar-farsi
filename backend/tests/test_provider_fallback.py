@@ -36,12 +36,11 @@ from app.services.correction import (
     ProviderSlot,
     SlotCooldown,
 )
-from app.services.prompt import PRESERVE_SYSTEM_PROMPT
+from app.services.prompt import PERSIAN_PROOFREADING_SYSTEM_PROMPT
 from tests.conftest import (
     SLOT_1_KEY,
     SLOT_1_MODEL,
     SLOT_1_URL_MARKER,
-    SLOT_2_BASE_URL,
     SLOT_2_KEY,
     SLOT_2_MODEL,
     SLOT_2_URL_MARKER,
@@ -128,11 +127,7 @@ def test_the_first_slot_answering_ends_the_request(
     response = provider_client.post(CORRECT_URL, json={"text": PERSIAN_TEXT})
 
     assert response.status_code == 200
-    body = response.json()
-    assert body["corrected_text"] == FIRST_TEXT
-    # The reported slot is the one that answered.
-    assert body["model_used"] == SLOT_1_MODEL
-    assert body["provider_name"] == "slot-1"
+    assert response.json() == {"corrected_text": FIRST_TEXT}
     # Exactly one request, to slot 1 only.
     assert len(provider_transport.requests) == 1
     assert provider_transport.requests_for(SLOT_2_URL_MARKER) == []
@@ -153,45 +148,13 @@ def test_any_slot_failure_falls_back_to_the_next_slot(
     response = provider_client.post(CORRECT_URL, json={"text": PERSIAN_TEXT})
 
     assert response.status_code == 200
-    body = response.json()
-    assert body["corrected_text"] == SECOND_TEXT
-    # The metadata comes from the winning fallback slot, not from slot 1.
-    assert body["model_used"] == SLOT_2_MODEL
-    assert body["provider_name"] == "slot-2"
+    assert response.json() == {"corrected_text": SECOND_TEXT}
     # One attempt per slot, in index order, and no retry of the failed slot.
     assert len(provider_transport.requests_for(SLOT_1_URL_MARKER)) == 1
     assert len(provider_transport.requests_for(SLOT_2_URL_MARKER)) == 1
     assert len(provider_transport.requests) == 2
     assert SLOT_1_URL_MARKER in provider_transport.urls[0]
     assert SLOT_2_URL_MARKER in provider_transport.urls[1]
-
-
-def test_fallback_reports_the_configured_name_and_model_of_the_winning_slot(
-    monkeypatch: pytest.MonkeyPatch,
-    provider_transport: ProviderTransport,
-    provider_client: TestClient,
-    provider_slots: None,
-) -> None:
-    define_slot(
-        monkeypatch,
-        2,
-        base_url=SLOT_2_BASE_URL,
-        api_key=SLOT_2_KEY,
-        model="backup-model-v2",
-        name="backup-provider",
-    )
-    provider_transport.respond_for(SLOT_1_URL_MARKER, lambda _: chat_completion_error(401))
-    provider_transport.respond_for(
-        SLOT_2_URL_MARKER, lambda _: chat_completion_response(SECOND_TEXT)
-    )
-
-    response = provider_client.post(CORRECT_URL, json={"text": PERSIAN_TEXT})
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["corrected_text"] == SECOND_TEXT
-    assert body["model_used"] == "backup-model-v2"
-    assert body["provider_name"] == "backup-provider"
 
 
 def test_fallback_resends_the_same_prompt_and_user_text(
@@ -214,7 +177,7 @@ def test_fallback_resends_the_same_prompt_and_user_text(
     # Same request body except the model, which belongs to each slot.
     assert [body["messages"] for body in bodies] == [
         [
-            {"role": "system", "content": PRESERVE_SYSTEM_PROMPT},
+            {"role": "system", "content": PERSIAN_PROOFREADING_SYSTEM_PROMPT},
             {"role": "user", "content": "متن کاربر برای اصلاح"},
         ]
     ] * 2
@@ -266,10 +229,7 @@ def test_a_third_slot_is_tried_when_the_first_two_fail(
     response = provider_client.post(CORRECT_URL, json={"text": PERSIAN_TEXT})
 
     assert response.status_code == 200
-    body = response.json()
-    assert body["corrected_text"] == THIRD_TEXT
-    assert body["model_used"] == "stub-slot-3-model"
-    assert body["provider_name"] == "slot-3"
+    assert response.json() == {"corrected_text": THIRD_TEXT}
     assert [url.split("/")[2] for url in provider_transport.urls] == [
         "slot-one.test",
         "slot-two.test",
