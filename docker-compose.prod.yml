@@ -14,6 +14,15 @@ services:
       context: ./backend
     env_file:
       - .env
+    environment:
+      # Consented evaluation records must survive a container recreate and land
+      # on the bind mount below. Without this override the container-relative
+      # default resolves outside /app.
+      CORRECTION_LOG_PATH: /app/logs/corrections.jsonl
+    volumes:
+      # The host directory must be writable by UID 10001 (the image's app user),
+      # for example: install -d -m 700 -o 10001 -g 10001 logs
+      - ./logs:/app/logs
     healthcheck:
       test:
         - CMD

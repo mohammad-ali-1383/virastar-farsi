@@ -27,13 +27,9 @@ Only provider-related failures (a :class:`~app.errors.CorrectionError`, which is
 what the adapter raises) trigger the fallback. Any other exception is a bug in
 our own code and propagates instead of being masked by another attempt.
 
-The successful call also reports which slot answered and with which model, so a
-caller can tell which slot really produced the text rather than which one was
-tried first.
-
-The requested proofreading style picks one of the two fixed system prompts
-(`prompt.py`), and every slot of a request receives the same prompt: a fallback
-cannot change what the model is asked.
+The successful call also reports which slot answered and with which model, so the
+optional evaluation log records the slot that really produced the text rather
+than the one that was tried first (`correction-logging.md`).
 """
 
 from __future__ import annotations
@@ -52,7 +48,7 @@ from app.errors import (
     ProviderUnavailableError,
 )
 from app.services.openai_compatible import OpenAICompatibleProvider
-from app.services.prompt import CorrectionStyle, get_system_prompt
+from app.services.prompt import PERSIAN_PROOFREADING_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -115,16 +111,13 @@ class CorrectionResult:
 class CorrectionService(Protocol):
     """Interface implemented by every correction strategy."""
 
-    async def correct(
-        self, text: str, style: CorrectionStyle = "preserve"
-    ) -> CorrectionResult:
-        """Return the correction of ``text`` in ``style`` and the slot used.
+    async def correct(self, text: str) -> CorrectionResult:
+        """Return the correction of ``text`` and the slot that produced it.
 
         ``text`` is already validated, non-empty, and within the configured
-        length limit, and ``style`` is already validated by the request schema.
-        Implementations must return non-empty corrected text and raise a
-        :class:`~app.errors.CorrectionError` subclass when they cannot, rather
-        than fabricating a correction.
+        length limit. Implementations must return non-empty corrected text and
+        raise a :class:`~app.errors.CorrectionError` subclass when they cannot,
+        rather than fabricating a correction.
         """
         ...
 
@@ -202,12 +195,9 @@ class LLMCorrectionService:
         self._deadline_seconds = deadline_seconds
         self._cooldowns = cooldowns if cooldowns is not None else SlotCooldown(clock=clock)
 
-    async def correct(
-        self, text: str, style: CorrectionStyle = "preserve"
-    ) -> CorrectionResult:
+    async def correct(self, text: str) -> CorrectionResult:
         """Try the configured slots in order and return the first correction.
 
-        The selected style decides which fixed system prompt every slot receives.
         Every failed slot is logged with its name and a sanitized error code only;
         the user's text, the keys, and the provider response bodies never reach
         the logs. When no slot can answer, one generic service error is raised.
@@ -215,7 +205,6 @@ class LLMCorrectionService:
         if not self._slots:
             raise ProviderUnavailableError("no provider slot is configured")
 
-        system_prompt = get_system_prompt(style)
         failures: list[str] = []
         deadline = self._clock() + self._deadline_seconds
 
@@ -235,7 +224,7 @@ class LLMCorrectionService:
 
             try:
                 corrected_text = await slot.adapter.generate(
-                    system_instruction=system_prompt,
+                    system_instruction=PERSIAN_PROOFREADING_SYSTEM_PROMPT,
                     user_text=text,
                     timeout_seconds=remaining,
                 )

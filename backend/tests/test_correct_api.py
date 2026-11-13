@@ -47,16 +47,8 @@ def test_valid_text_returns_documented_success_shape(
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
-    assert response.json() == {
-        "corrected_text": "سلام، این یک متن آزمایشی است.",
-        "model_used": stub_service.model,
-        "provider_name": stub_service.provider,
-    }
-    assert list(response.json()) == [
-        "corrected_text",
-        "model_used",
-        "provider_name",
-    ]
+    assert response.json() == {"corrected_text": "سلام، این یک متن آزمایشی است."}
+    assert list(response.json()) == ["corrected_text"]
 
 
 def test_valid_text_returns_non_empty_corrected_text(
@@ -66,45 +58,6 @@ def test_valid_text_returns_non_empty_corrected_text(
 
     assert response.status_code == 200
     assert response.json()["corrected_text"].strip()
-
-
-def test_success_reports_the_model_and_provider_that_answered(
-    client: TestClient, stub_service: StubCorrectionService
-) -> None:
-    stub_service.result = "متن اصلاح‌شده"
-    stub_service.provider = "backup-slot"
-    stub_service.model = "provider-model-v2"
-
-    response = client.post(CORRECT_URL, json={"text": PERSIAN_TEXT})
-
-    body = response.json()
-    assert body["corrected_text"] == "متن اصلاح‌شده"
-    assert body["model_used"] == "provider-model-v2"
-    assert body["provider_name"] == "backup-slot"
-
-
-def test_the_new_fields_are_documented_in_the_openapi_schema(
-    client: TestClient,
-) -> None:
-    schema = client.get("/openapi.json").json()
-    response_schema = schema["components"]["schemas"]["CorrectResponse"]
-
-    assert {"corrected_text", "model_used", "provider_name"} <= set(
-        response_schema["properties"]
-    )
-
-
-def test_a_client_that_only_reads_corrected_text_still_works(
-    client: TestClient, stub_service: StubCorrectionService
-) -> None:
-    stub_service.result = "متن اصلاح‌شده"
-
-    response = client.post(CORRECT_URL, json={"text": PERSIAN_TEXT})
-
-    # The old contract field keeps its exact name, type, and value; the new
-    # fields are additive only.
-    assert response.status_code == 200
-    assert response.json()["corrected_text"] == "متن اصلاح‌شده"
 
 
 def test_text_is_trimmed_before_it_reaches_the_service(
@@ -142,78 +95,42 @@ def test_health_endpoint_still_works(client: TestClient) -> None:
     assert response.json() == {"status": "ok"}
 
 
-# --- Proofreading style (`api-contract.md` -> Request) ----------------------
+# --- Consent flag (`correction-logging.md`) ---------------------------------
 
 
-def test_style_is_optional_and_defaults_to_preserve() -> None:
-    assert CorrectRequest(text=PERSIAN_TEXT).style == "preserve"
+def test_consent_flag_is_optional_and_defaults_to_not_storing() -> None:
+    assert CorrectRequest(text=PERSIAN_TEXT).store_for_evaluation is False
 
 
-def test_style_is_documented_in_the_openapi_schema(client: TestClient) -> None:
+def test_consent_flag_is_documented_in_the_openapi_schema(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     request_schema = schema["components"]["schemas"]["CorrectRequest"]
 
-    assert "style" in request_schema["properties"]
-    # Optional: the documented default preserves the writer's register.
-    assert "style" not in request_schema.get("required", [])
-    assert request_schema["properties"]["style"]["default"] == "preserve"
-    assert set(request_schema["properties"]["style"]["enum"]) == {
-        "preserve",
-        "formal",
-    }
+    assert "store_for_evaluation" in request_schema["properties"]
+    # Optional: the documented default is the privacy-preserving one.
+    assert "store_for_evaluation" not in request_schema.get("required", [])
+    assert request_schema["properties"]["store_for_evaluation"]["default"] is False
 
 
-def test_each_documented_style_reaches_the_service(
+def test_a_valid_request_with_either_consent_value_succeeds(
     client: TestClient, stub_service: StubCorrectionService
 ) -> None:
     stub_service.result = PERSIAN_TEXT
 
-    for style in ("preserve", "formal"):
-        response = client.post(CORRECT_URL, json={"text": PERSIAN_TEXT, "style": style})
+    for store in (True, False):
+        response = client.post(CORRECT_URL, json={"text": PERSIAN_TEXT, "store_for_evaluation": store})
 
         assert response.status_code == 200
-        assert response.json()["corrected_text"] == PERSIAN_TEXT
-
-    assert stub_service.styles == ["preserve", "formal"]
+        assert response.json() == {"corrected_text": PERSIAN_TEXT}
 
 
-def test_an_omitted_style_is_preserve_for_the_service(
-    client: TestClient, stub_service: StubCorrectionService
-) -> None:
-    client.post(CORRECT_URL, json={"text": PERSIAN_TEXT})
-
-    assert stub_service.styles == ["preserve"]
-
-
-@pytest.mark.parametrize(
-    "style",
-    [
-        pytest.param("preserve ", id="trailing-space"),
-        pytest.param("Preserve", id="wrong-case"),
-        pytest.param("formal-informal", id="unknown-value"),
-        pytest.param("", id="empty"),
-        pytest.param(None, id="null"),
-        pytest.param(1, id="wrong-type-number"),
-    ],
-)
-def test_an_unsupported_style_is_invalid_input(
-    client: TestClient, stub_service: StubCorrectionService, style: object
-) -> None:
-    response = client.post(CORRECT_URL, json={"text": PERSIAN_TEXT, "style": style})
+def test_a_non_boolean_consent_value_is_invalid_input(client: TestClient) -> None:
+    response = client.post(
+        CORRECT_URL, json={"text": PERSIAN_TEXT, "store_for_evaluation": "true"}
+    )
 
     assert response.status_code == 400
     assert response.json()["error"] == INVALID_INPUT
-    assert stub_service.received == []
-
-
-def test_the_removed_consent_flag_is_ignored(client: TestClient) -> None:
-    # Logging is gone entirely: a client that still sends the old flag is not an
-    # error, and nothing is stored anywhere (there is no store left).
-    response = client.post(
-        CORRECT_URL, json={"text": PERSIAN_TEXT, "store_for_evaluation": True}
-    )
-
-    assert response.status_code == 200
 
 
 # --- Invalid input ----------------------------------------------------------
@@ -282,7 +199,7 @@ def test_text_of_exactly_max_length_is_accepted(
     response = client.post(CORRECT_URL, json={"text": text})
 
     assert response.status_code == 200
-    assert response.json()["corrected_text"] == text
+    assert response.json() == {"corrected_text": text}
     assert len(stub_service.received[0]) == 1000
 
 

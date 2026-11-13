@@ -1,16 +1,14 @@
-"""Regression tests for the two Persian proofreading prompts.
+"""Regression tests for the Persian proofreading prompt.
 
-The prompts are specification artifacts: they are the instructions the LLM
-receives and the only part of the correction behaviour that is under our control.
-Each style has one constant and one document, and these tests keep them in sync:
+The prompt is a specification artifact: it is the instruction the LLM receives
+and the only part of the correction behaviour that is under our control. These
+tests are deterministic and make no provider call — they pin the text sent to the
+provider, keep it synchronized with ``context/correction-prompt.md``, and require
+a documented rule for every Persian case we care about.
 
-- ``preserve`` -> ``PRESERVE_SYSTEM_PROMPT`` / ``context/correction-prompt.md``
-- ``formal``   -> ``FORMAL_SYSTEM_PROMPT``   / ``context/correction-prompt-formal.md``
-
-They are deterministic and make no provider call — they pin the text sent to the
-provider and require a documented rule for every Persian case we care about. A
-live model reproducing these cases needs a real (billable) API call, which is the
-manual quality check in `testing.md` -> Correction Quality.
+The cases below are the reference set for the manual quality check
+(`testing.md` -> Correction Quality, `context/correction-prompt.md`): a live
+model must reproduce them, which only a real (billable) API call can show.
 """
 
 from __future__ import annotations
@@ -20,51 +18,50 @@ from pathlib import Path
 
 import pytest
 
-from app.services.prompt import (
-    FORMAL_SYSTEM_PROMPT,
-    PRESERVE_SYSTEM_PROMPT,
-    SYSTEM_PROMPTS,
-    get_system_prompt,
-)
+from app.services.prompt import PERSIAN_PROOFREADING_SYSTEM_PROMPT
+
+PROMPT = PERSIAN_PROOFREADING_SYSTEM_PROMPT
+LOWERED = PROMPT.lower()
+
+# ``backend/tests/test_correction_prompt.py`` -> repository root -> context/.
+SPEC_PATH = Path(__file__).resolve().parents[2] / "context" / "correction-prompt.md"
+
+SPEC_SYSTEM_PROMPT_HEADING = "## System Prompt"
+SPEC_IMPLEMENTATION_HEADING = "## Implementation Rules"
 
 # Zero-width non-joiner (Persian half-space). Persian words that need a
 # half-space are built from this constant so the test never depends on how an
 # editor or paste operation stores the character.
 ZWNJ = "\u200c"
 
-MI_KHAM = f"می{ZWNJ}خوام"  # colloquial "I want" — preserved by "preserve"
-MI_KHAHAM = f"می{ZWNJ}خواهم"  # formal "I want" — required by "formal"
+MI_KHAM = f"می{ZWNJ}خوام"  # colloquial "I want" — must survive unchanged
+MI_KHAHAM = f"می{ZWNJ}خواهم"  # formal "I want" — not the target of a rewrite
 MI_YAY = f"می{ZWNJ}ای"  # colloquial "you come"
 MI_RAM = f"می{ZWNJ}رم"  # colloquial "I go"
-MI_ROUM = f"می{ZWNJ}روم"  # formal "I go"
+MI_RI = f"می{ZWNJ}ری"  # colloquial "you go"
 KHANE_HA = f"خانه{ZWNJ}ها"  # "houses"
+NEMI_TAVANAM = f"نمی{ZWNJ}توانم"  # "I cannot"
+NIM_FASELE = f"نیم{ZWNJ}فاصله"  # "half-space"
+HICH_KAS_JOINED = f"هیچ{ZWNJ}کس"  # the joined variant of "nobody"
 
-# ``backend/tests/test_correction_prompt.py`` -> repository root -> context/.
-CONTEXT_DIR = Path(__file__).resolve().parents[2] / "context"
+# The sample named in the task: three lines, each with a different kind of error.
+GOLDEN_INPUT = f"سلا\n{MI_KHAM} برم شمال ایران\nمیایبریم"
+GOLDEN_EXPECTED = f"سلام، {MI_KHAM} برم شمال ایران. {MI_YAY} بریم؟"
 
-SPEC_SYSTEM_PROMPT_HEADING = "## System Prompt"
-SPEC_IMPLEMENTATION_HEADING = "## Implementation"
+# Each correction in the golden sample, the text it must affect, and the prompt
+# rule that authorises it.
+GOLDEN_RULE_COVERAGE = [
+    ("context-aware typo correction", "سلا", "سلام", "context"),
+    ("word-boundary correction", "میایبریم", f"{MI_YAY} بریم", "word boundaries"),
+    # Register preservation: the colloquial form survives the correction.
+    ("colloquial register preservation", MI_KHAM, MI_KHAM, "colloquial"),
+]
 
-# style -> (constant, specification document, the rule set that must be there).
-PROMPTS = {
-    "preserve": (PRESERVE_SYSTEM_PROMPT, "correction-prompt.md"),
-    "formal": (FORMAL_SYSTEM_PROMPT, "correction-prompt-formal.md"),
-}
-
-STYLE_IDS = list(PROMPTS)
-
-
-def _system_prompt_section(document: str) -> str:
-    """The System Prompt section of a specification document, normalized."""
-    if SPEC_SYSTEM_PROMPT_HEADING not in document:
-        raise AssertionError("the specification has no System Prompt section")
-    if SPEC_IMPLEMENTATION_HEADING not in document:
-        raise AssertionError("the specification has no Implementation section")
-
-    start = document.index(SPEC_SYSTEM_PROMPT_HEADING) + len(SPEC_SYSTEM_PROMPT_HEADING)
-    end = document.index(SPEC_IMPLEMENTATION_HEADING)
-
-    return document[start:end].strip().replace("\r\n", "\n")
+# The Persian words and punctuation the prompt is allowed to contain: language
+# examples only, never Persian instructions.
+ALLOWED_PERSIAN = (
+    set("«»،؟") | set("سلا سلام") | set(MI_KHAM + MI_KHAHAM + NIM_FASELE) | {ZWNJ}
+)
 
 
 @dataclass(frozen=True)
@@ -72,32 +69,26 @@ class CorrectionCase:
     """A documented Persian case, its expected result, and the governing rule.
 
     ``expected == text`` means the prompt requires the text to be returned
-    unchanged; any other ``expected`` is a correction the prompt must authorize.
-    ``style`` is the prompt whose rules must cover the case.
+    unchanged; any other ``expected`` is a correction the prompt must authorise.
     """
 
     name: str
-    style: str
     text: str
     expected: str
     prompt_rule: str
     rationale: str
 
 
-# Corrections both styles must make: a spelling/context fix, half-spaces, joined
-# words, spacing before punctuation, and a recovered question mark.
-SHARED_CASES = (
+CORRECTION_CASES = (
     CorrectionCase(
         name="missing-question-mark",
-        style="preserve",
-        text=f"کجا {MI_YAY}",
-        expected=f"کجا {MI_YAY}؟",
-        prompt_rule="question mark",
+        text=f"کجا {MI_RI}",
+        expected=f"کجا {MI_RI}؟",
+        prompt_rule="question marks",
         rationale="A question with no punctuation at all still needs a question mark.",
     ),
     CorrectionCase(
         name="half-spaces-and-word-boundaries",
-        style="preserve",
         text="من می خواهم به خانه ها بروم",
         expected=f"من {MI_KHAHAM} به {KHANE_HA} بروم",
         prompt_rule="half-space",
@@ -105,7 +96,6 @@ SHARED_CASES = (
     ),
     CorrectionCase(
         name="spacing-before-punctuation",
-        style="preserve",
         text="سلام ، حالت چطور است ؟",
         expected="سلام، حالت چطور است؟",
         prompt_rule="spacing",
@@ -113,7 +103,6 @@ SHARED_CASES = (
     ),
     CorrectionCase(
         name="joined-words",
-        style="preserve",
         text="میایبریم",
         expected=f"{MI_YAY} بریم",
         prompt_rule="word boundaries",
@@ -121,44 +110,16 @@ SHARED_CASES = (
     ),
     CorrectionCase(
         name="contextual-typo",
-        style="preserve",
         text="سلا، حالت خوبه؟",
         expected="سلام، حالت خوبه؟",
         prompt_rule="context",
         rationale="The greeting is the only reading that fits the context.",
     ),
-    CorrectionCase(
-        name="formal-question-mark",
-        style="formal",
-        text=f"کجا {MI_YAY}",
-        expected=f"کجا {MI_YAY}؟",
-        prompt_rule="question mark",
-        rationale="The formal prompt requires complete punctuation as well.",
-    ),
-    CorrectionCase(
-        name="formal-half-spaces",
-        style="formal",
-        text="من می خواهم به خانه ها بروم",
-        expected=f"من {MI_KHAHAM} به {KHANE_HA} بروم",
-        prompt_rule="half-space",
-        rationale=f"The formal prompt also fixes {MI_KHAHAM} and {KHANE_HA}.",
-    ),
-    CorrectionCase(
-        name="formal-contextual-typo",
-        style="formal",
-        text="سلا، حالت خوبه؟",
-        expected="سلام، حالت خوبه؟",
-        prompt_rule="spelling",
-        rationale="Spelling is corrected before the register is adjusted.",
-    ),
 )
 
-# Behaviour that belongs to the "preserve" style only: the writer's wording and
-# register survive the correction.
 PRESERVATION_CASES = (
     CorrectionCase(
         name="already-correct-text",
-        style="preserve",
         text="این متن از پیش درست است.",
         expected="این متن از پیش درست است.",
         prompt_rule="unchanged",
@@ -166,15 +127,13 @@ PRESERVATION_CASES = (
     ),
     CorrectionCase(
         name="formal-register-kept",
-        style="preserve",
-        text=f"من {MI_KHAHAM} در این جلسه شرکت کنم.",
-        expected=f"من {MI_KHAHAM} در این جلسه شرکت کنم.",
+        text=f"من {NEMI_TAVANAM} در این جلسه شرکت کنم.",
+        expected=f"من {NEMI_TAVANAM} در این جلسه شرکت کنم.",
         prompt_rule="formal",
         rationale="Correct formal Persian is not rewritten for style.",
     ),
     CorrectionCase(
         name="colloquial-register-kept",
-        style="preserve",
         text=f"دیروز رفتم بازار، امروز {MI_KHAM} برم خونه.",
         expected=f"دیروز رفتم بازار، امروز {MI_KHAM} برم خونه.",
         prompt_rule="colloquial",
@@ -182,15 +141,13 @@ PRESERVATION_CASES = (
     ),
     CorrectionCase(
         name="ambiguous-word-separation",
-        style="preserve",
         text="هیچ کس جواب نداد.",
         expected="هیچ کس جواب نداد.",
         prompt_rule="ambiguous",
-        rationale=f"Both «هیچ کس» and «هیچ{ZWNJ}کس» are standard; leave it rather than guess.",
+        rationale=f"Both «هیچ کس» and «{HICH_KAS_JOINED}» are standard; leave it rather than guess.",
     ),
     CorrectionCase(
         name="ambiguous-typo-not-guessed",
-        style="preserve",
         text=f"{MI_RAM} خونه دوستم.",
         expected=f"{MI_RAM} خونه دوستم.",
         prompt_rule="ambiguous",
@@ -198,204 +155,102 @@ PRESERVATION_CASES = (
     ),
 )
 
-# The core behaviour of the "formal" style: colloquial wording becomes formal.
-FORMAL_CONVERSION_CASES = (
-    CorrectionCase(
-        name="colloquial-to-formal-verb",
-        style="formal",
-        text=f"امروز {MI_KHAM} برم بازار.",
-        expected=f"امروز {MI_KHAHAM} بروم بازار.",
-        prompt_rule="formal",
-        rationale=f"The formal style converts {MI_KHAM} to {MI_KHAHAM}.",
-    ),
-    CorrectionCase(
-        name="colloquial-go-verb",
-        style="formal",
-        text="دیروز رفتم بازار، فردا می رم.",
-        expected=f"دیروز رفتم بازار، فردا {MI_ROUM}.",
-        prompt_rule=MI_RAM,
-        rationale=f"The formal style converts «{MI_RAM}» to «{MI_ROUM}».",
-    ),
-    CorrectionCase(
-        name="colloquial-particles",
-        style="formal",
-        text="اگه واسه من وقت داری، بگو.",
-        expected="اگر برای من وقت دارید، بفرمایید.",
-        prompt_rule="اگر",
-        rationale="«اگه» and «واسه» are colloquial and become «اگر» and «برای».",
-    ),
-)
+ALL_CASES = CORRECTION_CASES + PRESERVATION_CASES
 
-ALL_CASES = SHARED_CASES + PRESERVATION_CASES + FORMAL_CONVERSION_CASES
-
-# The documented Persian examples of the "preserve" prompt, as before/after
-# pairs. They are pinned so the prompt cannot silently lose its examples.
-PRESERVE_EXAMPLES = (
-    ("غشنگ", "قشنگ"),
-    ("میخوام", MI_KHAM),
-    ("سلا", "سلام"),
-    ("ک برم", "که برم"),
-    ("می خوام", MI_KHAM),
-    ("نمی دونم", f"نمی{ZWNJ}دونم"),
-    ("خانه ها", KHANE_HA),
-    ("کتاب های", f"کتاب{ZWNJ}های"),
-)
-
-# The documented colloquial -> formal conversions of the "formal" prompt.
-FORMAL_EXAMPLES = (
-    (MI_KHAM, MI_KHAHAM),
-    (MI_RAM, MI_ROUM),
-    ("اگه", "اگر"),
-    ("واسه", "برای"),
-    (f"نمی{ZWNJ}دونم", f"نمی{ZWNJ}دانم"),
-)
-
-# The sample named in `correction-prompt.md`: three lines, each a different error.
-GOLDEN_INPUT = f"سلا\n{MI_KHAM} برم شمال ایران\nمیایبریم"
-GOLDEN_EXPECTED = f"سلام، {MI_KHAM} برم شمال ایران. {MI_YAY} بریم؟"
+HALF_SPACE_CASE = next(case for case in CORRECTION_CASES if case.name == "half-spaces-and-word-boundaries")
+QUESTION_CASE = next(case for case in CORRECTION_CASES if case.name == "missing-question-mark")
 
 
-@pytest.fixture(scope="module", params=STYLE_IDS)
-def styled_prompt(request: pytest.FixtureRequest) -> tuple[str, str, str]:
-    """(style, prompt constant, specification document) for one style."""
-    style = str(request.param)
-    prompt, document_name = PROMPTS[style]
-    document = (CONTEXT_DIR / document_name).read_text(encoding="utf-8")
+@pytest.fixture(scope="module")
+def spec_system_prompt() -> str:
+    """The System Prompt section of the specification document, normalized."""
+    document = SPEC_PATH.read_text(encoding="utf-8")
 
-    return style, prompt, document
+    assert SPEC_SYSTEM_PROMPT_HEADING in document
+    assert SPEC_IMPLEMENTATION_HEADING in document
 
+    start = document.index(SPEC_SYSTEM_PROMPT_HEADING) + len(SPEC_SYSTEM_PROMPT_HEADING)
+    end = document.index(SPEC_IMPLEMENTATION_HEADING)
 
-# --- Prompt text and specification sync -------------------------------------
-
-
-def test_each_documented_style_has_a_prompt() -> None:
-    assert set(SYSTEM_PROMPTS) == {"preserve", "formal"}
-    for style, (prompt, _) in PROMPTS.items():
-        assert get_system_prompt(style) == prompt
+    return document[start:end].strip().replace("\r\n", "\n")
 
 
-def test_the_two_prompts_are_different() -> None:
-    assert PRESERVE_SYSTEM_PROMPT != FORMAL_SYSTEM_PROMPT
+# --- The prompt text itself -------------------------------------------------
 
 
-def test_the_prompt_matches_its_specification_document(
-    styled_prompt: tuple[str, str, str],
-) -> None:
-    style, prompt, document = styled_prompt
-
-    # Single source of truth: the constant and its document must not drift apart.
-    assert _system_prompt_section(document) == prompt, style
+def test_prompt_opens_with_the_documented_role() -> None:
+    assert PROMPT.startswith("You are a professional Persian-language proofreader.")
 
 
-def test_the_prompt_opens_with_the_documented_role(
-    styled_prompt: tuple[str, str, str],
-) -> None:
-    _, prompt, _ = styled_prompt
+def test_prompt_keeps_six_numbered_rules() -> None:
+    # The six documented instruction groups must survive future edits.
+    missing = [f"{number}." for number in range(1, 7) if f"\n{number}. " not in PROMPT]
 
-    assert prompt.startswith("You are a professional Persian-language proofreader")
-
-
-def test_the_prompt_returns_only_corrected_persian_text(
-    styled_prompt: tuple[str, str, str],
-) -> None:
-    _, prompt, _ = styled_prompt
-    lowered = prompt.lower()
-
-    assert "return **only** the corrected" in lowered
-    assert "do not add" in lowered
-    assert "quotation marks" in lowered
+    assert missing == []
 
 
-# Instructions every style must keep, plus the ones that define each style
-# (register preservation vs. conversion to a formal register).
-REQUIRED_INSTRUCTIONS: dict[str, tuple[str, ...]] = {
-    "preserve": (
-        "spelling",
-        "context",
-        "word boundaries",
-        "half-space",
-        "spacing",
-        "punctuation",
-        "typography",
-        "question mark",
-        "invent",
-        "meaning",
-        "line breaks",
-        "colloquial",
-    ),
-    "formal": (
-        "spelling",
-        "half-space",
-        "spacing",
-        "punctuation",
-        "typography",
-        "question mark",
-        "invent",
-        "meaning",
-        "line breaks",
-        "colloquial",
-        "formal",
-    ),
-}
+def test_prompt_matches_the_specification_document(spec_system_prompt: str) -> None:
+    # Single source of truth: the constant and `context/correction-prompt.md`
+    # must not drift apart.
+    assert spec_system_prompt == PROMPT
+
+
+def test_prompt_is_english_and_persian_appears_only_in_examples() -> None:
+    unexpected = {character for character in PROMPT if ord(character) > 127} - ALLOWED_PERSIAN
+
+    assert unexpected == set()
+
+
+def test_prompt_documents_the_context_typo_example() -> None:
+    assert "«سلا»" in PROMPT
+    assert "«سلام»" in PROMPT
+
+
+def test_prompt_documents_the_register_example() -> None:
+    # The colloquial form is kept; the formal one is explicitly not a rewrite target.
+    assert f"«{MI_KHAM}»" in PROMPT
+    assert f"«{MI_KHAHAM}»" in PROMPT
+    assert "never convert colloquial forms to formal ones" in LOWERED
 
 
 @pytest.mark.parametrize(
-    ("style", "requirement"),
+    "requirement",
     [
-        (style, requirement)
-        for style, requirements in REQUIRED_INSTRUCTIONS.items()
-        for requirement in requirements
+        "context",
+        "ambiguous",
+        "colloquial",
+        "formal",
+        "spelling",
+        "grammar",
+        "word boundaries",
+        "half-space",
+        "zwnj",
+        "spacing",
+        "punctuation",
+        "typography",
+        "comma",
+        "period",
+        "question mark",
+        "no explicit punctuation",
+        "invent meaning",
+        "add information",
+        "summarize",
+        "least invasive",
+        "return only the corrected persian text",
+        "line breaks",
+        "quotation marks",
+        "unchanged",
     ],
 )
-def test_the_prompt_covers_each_required_instruction(
-    style: str, requirement: str
-) -> None:
-    assert requirement in get_system_prompt(style).lower()
+def test_prompt_covers_each_required_instruction(requirement: str) -> None:
+    assert requirement in LOWERED
 
 
-def test_the_preserve_prompt_forbids_formalizing_colloquial_text() -> None:
-    lowered = PRESERVE_SYSTEM_PROMPT.lower()
-
-    assert "do **not** convert colloquial language into formal language" in lowered
-    assert f"keep «{MI_KHAM}»" in lowered
-    assert "formal register" not in lowered
+def test_prompt_requires_questions_to_be_recognized_without_punctuation() -> None:
+    assert "recognize questions even when the original carries no explicit punctuation" in LOWERED
 
 
-def test_the_formal_prompt_requires_a_formal_register() -> None:
-    lowered = FORMAL_SYSTEM_PROMPT.lower()
-
-    assert "convert to formal register" in lowered
-    assert "formal, polite, and administrative style" in lowered
-    # The formal style deliberately does not keep colloquial forms.
-    assert "do **not** convert colloquial language" not in lowered
-
-
-def test_the_preserve_prompt_documents_its_persian_examples() -> None:
-    missing = [
-        f"«{before}» → «{after}»"
-        for before, after in PRESERVE_EXAMPLES
-        if f"«{before}» → «{after}»" not in PRESERVE_SYSTEM_PROMPT
-    ]
-
-    assert missing == []
-
-
-def test_the_formal_prompt_documents_its_colloquial_to_formal_examples() -> None:
-    missing = [
-        f"«{before}» → «{after}»"
-        for before, after in FORMAL_EXAMPLES
-        if f"«{before}» → «{after}»" not in FORMAL_SYSTEM_PROMPT
-    ]
-
-    assert missing == []
-
-
-def test_both_prompts_use_real_half_spaces() -> None:
-    for prompt, _ in PROMPTS.values():
-        assert ZWNJ in prompt
-
-
-# --- The named golden sample (the "preserve" style) -------------------------
+# --- The named golden sample ------------------------------------------------
 
 
 def test_golden_sample_is_well_formed() -> None:
@@ -427,6 +282,19 @@ def test_golden_sample_recovers_the_missing_punctuation() -> None:
     assert GOLDEN_EXPECTED.count(".") == 1
 
 
+@pytest.mark.parametrize(
+    ("description", "before", "after", "rule"),
+    GOLDEN_RULE_COVERAGE,
+    ids=[entry[0] for entry in GOLDEN_RULE_COVERAGE],
+)
+def test_golden_sample_is_covered_by_a_prompt_rule(
+    description: str, before: str, after: str, rule: str
+) -> None:
+    assert before in GOLDEN_INPUT
+    assert after in GOLDEN_EXPECTED
+    assert rule in LOWERED
+
+
 # --- The documented case set ------------------------------------------------
 
 
@@ -437,19 +305,14 @@ def test_case_names_are_unique() -> None:
 
 
 @pytest.mark.parametrize("case", ALL_CASES, ids=[case.name for case in ALL_CASES])
-def test_every_case_is_justified_by_its_prompt(case: CorrectionCase) -> None:
-    # Each expectation must map to something its style's prompt instructs.
-    assert case.style in PROMPTS
-    assert case.prompt_rule.lower() in get_system_prompt(case.style).lower()
+def test_every_case_is_justified_by_a_prompt_rule(case: CorrectionCase) -> None:
+    # Each expectation must map to something the prompt actually instructs.
+    assert case.prompt_rule.lower() in LOWERED
     assert case.rationale.strip()
     assert case.text.strip()
 
 
-@pytest.mark.parametrize(
-    "case",
-    [case for case in ALL_CASES if case.expected != case.text],
-    ids=[case.name for case in ALL_CASES if case.expected != case.text],
-)
+@pytest.mark.parametrize("case", CORRECTION_CASES, ids=[case.name for case in CORRECTION_CASES])
 def test_documented_corrections_change_the_text(case: CorrectionCase) -> None:
     assert case.expected != case.text
 
@@ -457,21 +320,16 @@ def test_documented_corrections_change_the_text(case: CorrectionCase) -> None:
 @pytest.mark.parametrize(
     "case", PRESERVATION_CASES, ids=[case.name for case in PRESERVATION_CASES]
 )
-def test_documented_preservation_cases_return_the_text_unchanged(
-    case: CorrectionCase,
-) -> None:
+def test_documented_preservation_cases_return_the_text_unchanged(case: CorrectionCase) -> None:
     assert case.expected == case.text
 
 
-def test_the_colloquial_case_is_a_half_space_correction() -> None:
-    case = next(case for case in SHARED_CASES if case.name == "half-spaces-and-word-boundaries")
+def test_half_space_case_uses_a_real_half_space() -> None:
+    assert ZWNJ not in HALF_SPACE_CASE.text
+    assert ZWNJ in HALF_SPACE_CASE.expected
+    assert ZWNJ in PROMPT
 
-    assert ZWNJ not in case.text
-    assert ZWNJ in case.expected
 
-
-def test_the_question_case_adds_a_question_mark() -> None:
-    case = next(case for case in SHARED_CASES if case.name == "missing-question-mark")
-
-    assert "؟" not in case.text
-    assert case.expected.endswith("؟")
+def test_question_case_adds_a_question_mark() -> None:
+    assert "؟" not in QUESTION_CASE.text
+    assert QUESTION_CASE.expected.endswith("؟")

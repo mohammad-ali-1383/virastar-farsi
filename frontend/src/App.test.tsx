@@ -1,11 +1,10 @@
 /**
- * Tests for the style-selection flow in `App` (`context/ui.md` ->
- * Proofreading style).
+ * Tests for the consent flow in `App` (`context/ui.md` -> Privacy and consent).
  *
  * The dialog is exercised through the real component tree with a stubbed
  * `fetch`, so what is verified is exactly what the browser would send: the
- * chosen `style` and the user's text, and no request at all when the dialog is
- * dismissed.
+ * explicit `store_for_evaluation` flag for both choices, and no request at all
+ * when the dialog is dismissed.
  */
 
 import { cleanup, render, screen } from "@testing-library/react";
@@ -13,19 +12,11 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
-import {
-  STYLE_DIALOG_TITLE,
-  STYLE_FORMAL_LABEL,
-  STYLE_PRESERVE_LABEL,
-} from "./StyleDialog";
+import { CONSENT_ACCEPT_LABEL, CONSENT_DECLINE_LABEL } from "./ConsentDialog";
 
 const USER_TEXT = "سلام این یک متن ازمایشی است";
 const CORRECTED_TEXT = "سلام، این یک متن آزمایشی است.";
-const MODEL_USED = "test-provider-model-v1";
-const MODEL_LABEL = `ویرایش‌شده با مدل: ${MODEL_USED}`;
 const CLOSE_LABEL = "بستن";
-const SUBMIT_LABEL = "اصلاح متن";
-const LOADING_LABEL = "در حال اصلاح…";
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -33,11 +24,7 @@ function stubSuccessfulFetch(): void {
   fetchMock = vi.fn().mockResolvedValue({
     ok: true,
     status: 200,
-    json: async () => ({
-      corrected_text: CORRECTED_TEXT,
-      model_used: MODEL_USED,
-      provider_name: "slot-1",
-    }),
+    json: async () => ({ corrected_text: CORRECTED_TEXT }),
   });
   vi.stubGlobal("fetch", fetchMock);
 }
@@ -48,20 +35,12 @@ function sentBody(): Record<string, unknown> {
   return JSON.parse(String(init.body)) as Record<string, unknown>;
 }
 
-function preserveOption(): HTMLElement {
-  return screen.getByRole("button", { name: new RegExp(STYLE_PRESERVE_LABEL) });
-}
-
-function formalOption(): HTMLElement {
-  return screen.getByRole("button", { name: new RegExp(STYLE_FORMAL_LABEL) });
-}
-
 async function submitText(user: ReturnType<typeof userEvent.setup>): Promise<void> {
   await user.type(screen.getByLabelText("متن شما"), USER_TEXT);
-  await user.click(screen.getByRole("button", { name: SUBMIT_LABEL }));
+  await user.click(screen.getByRole("button", { name: "اصلاح متن" }));
 }
 
-describe("correction style flow", () => {
+describe("correction consent flow", () => {
   beforeEach(stubSuccessfulFetch);
   afterEach(() => {
     // Unmount the tree so each test starts from an empty document (the project
@@ -70,100 +49,42 @@ describe("correction style flow", () => {
     vi.unstubAllGlobals();
   });
 
-  it("asks for a style before sending any request", async () => {
+  it("asks for consent before sending any request", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await submitText(user);
 
     expect(screen.getByRole("dialog")).toBeTruthy();
-    expect(screen.getByText(STYLE_DIALOG_TITLE)).toBeTruthy();
-    expect(preserveOption()).toBeTruthy();
-    expect(formalOption()).toBeTruthy();
+    expect(screen.getByRole("button", { name: CONSENT_ACCEPT_LABEL })).toBeTruthy();
+    expect(screen.getByRole("button", { name: CONSENT_DECLINE_LABEL })).toBeTruthy();
     // Nothing has left the browser yet.
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("recommends «حفظ لحن» by default and focuses it", async () => {
+  it("sends the flag as true when storing is chosen", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await submitText(user);
-
-    expect(document.activeElement).toBe(preserveOption());
-  });
-
-  it("sends style preserve when tone preservation is chosen", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-
-    await submitText(user);
-    await user.click(preserveOption());
+    await user.click(screen.getByRole("button", { name: CONSENT_ACCEPT_LABEL }));
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(sentBody()).toEqual({ text: USER_TEXT, style: "preserve" });
+    expect(sentBody()).toEqual({ text: USER_TEXT, store_for_evaluation: true });
     expect(await screen.findByText(CORRECTED_TEXT)).toBeTruthy();
   });
 
-  it("sends style formal when the administrative tone is chosen", async () => {
+  it("sends the flag as false when correction only is chosen", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await submitText(user);
-    await user.click(formalOption());
+    await user.click(screen.getByRole("button", { name: CONSENT_DECLINE_LABEL }));
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(sentBody()).toEqual({ text: USER_TEXT, style: "formal" });
+    expect(sentBody()).toEqual({ text: USER_TEXT, store_for_evaluation: false });
+    // The correction still happens for the declined choice.
     expect(await screen.findByText(CORRECTED_TEXT)).toBeTruthy();
-  });
-
-  it("shows the model that produced the correction", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-
-    await submitText(user);
-    await user.click(preserveOption());
-
-    expect(await screen.findByText(MODEL_LABEL)).toBeTruthy();
-  });
-
-  it("does not show the model label before or during the request", async () => {
-    const user = userEvent.setup();
-    let resolveFetch: ((value: unknown) => void) | undefined;
-    fetchMock.mockReturnValue(
-      new Promise((resolve) => {
-        resolveFetch = resolve;
-      }),
-    );
-    render(<App />);
-
-    await submitText(user);
-    expect(screen.queryByText(MODEL_LABEL)).toBeNull();
-
-    await user.click(preserveOption());
-    expect(screen.queryByText(MODEL_LABEL)).toBeNull();
-
-    resolveFetch?.({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        corrected_text: CORRECTED_TEXT,
-        model_used: MODEL_USED,
-        provider_name: "slot-1",
-      }),
-    });
-
-    expect(await screen.findByText(MODEL_LABEL)).toBeTruthy();
-  });
-
-  it("does not send the removed evaluation flag", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-
-    await submitText(user);
-    await user.click(preserveOption());
-
-    expect(sentBody()).not.toHaveProperty("store_for_evaluation");
   });
 
   it("posts to the correction endpoint with JSON", async () => {
@@ -171,7 +92,7 @@ describe("correction style flow", () => {
     render(<App />);
 
     await submitText(user);
-    await user.click(preserveOption());
+    await user.click(screen.getByRole("button", { name: CONSENT_ACCEPT_LABEL }));
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(String(url).endsWith("/api/v1/correct")).toBe(true);
@@ -214,26 +135,26 @@ describe("correction style flow", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("can be reopened after a dismissal and then sends the chosen style", async () => {
+  it("can be reopened after a dismissal and then sends the chosen flag", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await submitText(user);
     await user.keyboard("{Escape}");
-    await user.click(screen.getByRole("button", { name: SUBMIT_LABEL }));
-    await user.click(formalOption());
+    await user.click(screen.getByRole("button", { name: "اصلاح متن" }));
+    await user.click(screen.getByRole("button", { name: CONSENT_DECLINE_LABEL }));
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(sentBody()).toEqual({ text: USER_TEXT, style: "formal" });
+    expect(sentBody()).toEqual({ text: USER_TEXT, store_for_evaluation: false });
   });
 
-  it("does not ask for a style when there is no text to correct", async () => {
+  it("does not ask for consent when there is no text to correct", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     // The UI blocks an empty submission, so the dialog is never reached (the
     // empty-text guard inside the handler stays as defence in depth).
-    const submit = screen.getByRole("button", { name: SUBMIT_LABEL });
+    const submit = screen.getByRole("button", { name: "اصلاح متن" });
     expect((submit as HTMLButtonElement).disabled).toBe(true);
     await user.click(submit);
 
@@ -241,7 +162,7 @@ describe("correction style flow", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("does not ask for a style when the text is too long", async () => {
+  it("does not ask for consent when the text is too long", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -249,39 +170,10 @@ describe("correction style flow", () => {
     const textarea = screen.getByLabelText("متن شما");
     await user.click(textarea);
     await user.paste("ا".repeat(1001));
-    await user.click(screen.getByRole("button", { name: SUBMIT_LABEL }));
+    await user.click(screen.getByRole("button", { name: "اصلاح متن" }));
 
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("shows the loading state while the correction is in flight", async () => {
-    const user = userEvent.setup();
-    let resolveFetch: ((value: unknown) => void) | undefined;
-    fetchMock.mockReturnValue(
-      new Promise((resolve) => {
-        resolveFetch = resolve;
-      }),
-    );
-    render(<App />);
-
-    await submitText(user);
-    await user.click(preserveOption());
-
-    const loadingButton = screen.getByRole("button", { name: LOADING_LABEL });
-    expect((loadingButton as HTMLButtonElement).disabled).toBe(true);
-    expect(
-      (screen.getByLabelText("متن شما") as HTMLTextAreaElement).disabled,
-    ).toBe(true);
-
-    resolveFetch?.({
-      ok: true,
-      status: 200,
-      json: async () => ({ corrected_text: CORRECTED_TEXT }),
-    });
-
-    expect(await screen.findByText(CORRECTED_TEXT)).toBeTruthy();
-    expect(screen.getByRole("button", { name: SUBMIT_LABEL })).toBeTruthy();
   });
 
   it("shows the backend error message when the request fails", async () => {
@@ -294,10 +186,9 @@ describe("correction style flow", () => {
     render(<App />);
 
     await submitText(user);
-    await user.click(preserveOption());
+    await user.click(screen.getByRole("button", { name: CONSENT_ACCEPT_LABEL }));
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("سرویس در دسترس نیست.");
-    expect(screen.queryByText(/ویرایش‌شده با مدل/)).toBeNull();
   });
 });

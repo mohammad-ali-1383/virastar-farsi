@@ -7,11 +7,10 @@
 secrets/
 credentials.json
 Run-virastar.docx
-# Local design notes stay out of Git, except the prompt specifications that the
+# Local design notes stay out of Git, except the prompt specification that the
 # backend test suite reads and must keep in sync with the code.
 /context/*
 !/context/correction-prompt.md
-!/context/correction-prompt-formal.md
 /.freebuff/
 
 # Node / frontend
@@ -46,8 +45,8 @@ Thumbs.db
 *.log
 tmp/
 
-# Local correction logs can contain user text. Never commit them.
-logs/
-
 # Local live provider check (operator tool, never committed)
 /scripts/check_providers.py
+
+# Consented evaluation logs (may contain user text). Never commit them.
+logs/

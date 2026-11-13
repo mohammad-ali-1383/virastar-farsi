@@ -5,5 +5,3 @@ pydantic==2.14.1
 pydantic-settings==2.15.0
 # Used by the LLM adapter (Phase 3) and by FastAPI's test client.
 httpx==0.28.1
-# Word (.docx) export, generated in memory (`word-export-spec.md`).
-python-docx==1.2.0
