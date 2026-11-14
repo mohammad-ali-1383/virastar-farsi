@@ -121,9 +121,9 @@ body {
   cursor: not-allowed;
 }
 
-/* --- Consent dialog ------------------------------------------------------ */
+/* --- Dialogs ------------------------------------------------------------- */
 
-.consent {
+.dialog {
   position: fixed;
   inset: 0;
   display: flex;
@@ -134,7 +134,7 @@ body {
   z-index: 10;
 }
 
-.consent__panel {
+.dialog__panel {
   position: relative;
   max-width: 32rem;
   width: 100%;
@@ -144,23 +144,48 @@ body {
   box-shadow: 0 12px 32px rgba(31, 35, 40, 0.2);
 }
 
-.consent__panel h2 {
+.dialog__panel h2 {
   margin: 0 0 0.6rem;
   font-size: 1.15rem;
 }
 
-.consent__text {
+.dialog__text {
   margin: 0 0 1.1rem;
   color: #57606a;
 }
 
-.consent__actions {
+.dialog__actions {
   display: flex;
   flex-wrap: wrap;
   gap: 0.6rem;
 }
 
-.consent__close {
+.dialog__choices {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.dialog__choice {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  width: 100%;
+  padding: 0.7rem 1rem;
+  text-align: right;
+}
+
+.dialog__choice-hint {
+  font-weight: 400;
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.button--secondary .dialog__choice-hint {
+  color: #57606a;
+}
+
+.dialog__close {
   position: absolute;
   top: 0.6rem;
   left: 0.7rem;
@@ -174,7 +199,7 @@ body {
   cursor: pointer;
 }
 
-.consent__close:hover {
+.dialog__close:hover {
   color: #1f2328;
   background: #f1f3f5;
 }
@@ -230,8 +255,27 @@ body {
   cursor: pointer;
 }
 
-.button--ghost:hover {
+.button--ghost:hover:not(:disabled) {
   background: #e1eaff;
+}
+
+.button--ghost:disabled {
+  color: #8c959f;
+  background: #f1f3f5;
+  border-color: #d0d7de;
+  cursor: not-allowed;
+}
+
+.result__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.result-model {
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+  color: #57606a;
 }
 
 .copy-status {
@@ -242,6 +286,85 @@ body {
 
 .copy-status--error {
   color: #b42318;
+}
+
+/* --- Export settings dialog --------------------------------------------- */
+
+.dialog__panel--settings {
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+}
+
+.settings {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.settings__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem 1rem;
+}
+
+.settings__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+  color: #57606a;
+}
+
+.settings__field select {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  font: inherit;
+  color: #1f2328;
+  background: #ffffff;
+  border: 1px solid #d0d7de;
+  border-radius: 8px;
+}
+
+.settings__field select:focus {
+  outline: 2px solid #1f6feb;
+  outline-offset: 1px;
+  border-color: #1f6feb;
+}
+
+.settings__field select:disabled {
+  color: #8c959f;
+  background: #f1f3f5;
+  cursor: not-allowed;
+}
+
+.settings__checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.5rem;
+}
+
+.settings__check {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.settings__check input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: #1f6feb;
+}
+
+.settings__note {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #57606a;
+}
+
+@media (max-width: 520px) {
+  .settings__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* --- Error state --------------------------------------------------------- */
