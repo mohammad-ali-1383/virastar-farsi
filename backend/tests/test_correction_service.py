@@ -33,7 +33,12 @@ from app.services.correction import (
     ProviderSlot,
     get_correction_service,
 )
-from app.services.prompt import PERSIAN_PROOFREADING_SYSTEM_PROMPT
+from app.services.prompt import (
+    FORMAL_SYSTEM_PROMPT,
+    PRESERVE_SYSTEM_PROMPT,
+    SYSTEM_PROMPTS,
+    get_system_prompt,
+)
 from tests.conftest import (
     SLOT_1_KEY,
     SLOT_1_MODEL,
@@ -83,8 +88,12 @@ def _service(*providers: LLMProvider) -> LLMCorrectionService:
     )
 
 
-def _correct(service: LLMCorrectionService, text: str = PERSIAN_TEXT) -> CorrectionResult:
-    return asyncio.run(service.correct(text))
+def _correct(
+    service: LLMCorrectionService,
+    text: str = PERSIAN_TEXT,
+    style: str = "preserve",
+) -> CorrectionResult:
+    return asyncio.run(service.correct(text, style))
 
 
 # --- Service behaviour ------------------------------------------------------
@@ -98,7 +107,7 @@ def test_service_sends_the_prompt_and_user_text_separately() -> None:
 
     assert result.text == "متن اصلاح‌شده"
     assert [(prompt, text) for prompt, text, _ in first.calls] == [
-        (PERSIAN_PROOFREADING_SYSTEM_PROMPT, PERSIAN_TEXT)
+        (PRESERVE_SYSTEM_PROMPT, PERSIAN_TEXT)
     ]
     # A successful first slot means the second one is never touched.
     assert second.calls == []
@@ -107,8 +116,7 @@ def test_service_sends_the_prompt_and_user_text_separately() -> None:
 def test_result_names_the_slot_and_model_that_succeeded() -> None:
     result = _correct(_service(_RecordingProvider(result="ok"), _RecordingProvider()))
 
-    # What the evaluation log records: the slot that produced the text and the
-    # model ID it sends.
+    # The result names the slot that produced the text and the model ID it sends.
     assert (result.provider, result.model) == ("slot-1", "model-1")
 
 
@@ -131,8 +139,46 @@ def test_fallback_receives_the_same_prompt_and_user_text() -> None:
 
     # Same request, other slot: a fallback cannot change what is asked.
     assert [(prompt, text) for prompt, text, _ in second.calls] == [
-        (PERSIAN_PROOFREADING_SYSTEM_PROMPT, "متن کاربر برای اصلاح")
+        (PRESERVE_SYSTEM_PROMPT, "متن کاربر برای اصلاح")
     ]
+
+
+# --- Style selection --------------------------------------------------------
+
+
+def test_the_default_style_sends_the_preserve_prompt() -> None:
+    first = _RecordingProvider(result="ok")
+
+    asyncio.run(_service(first).correct(PERSIAN_TEXT))
+
+    assert first.calls[0][0] == PRESERVE_SYSTEM_PROMPT
+
+
+def test_the_formal_style_sends_the_formal_prompt() -> None:
+    first = _RecordingProvider(result="ok")
+
+    _correct(_service(first), style="formal")
+
+    assert first.calls[0][0] == FORMAL_SYSTEM_PROMPT
+    assert first.calls[0][0] != PRESERVE_SYSTEM_PROMPT
+
+
+def test_a_fallback_keeps_the_requested_style() -> None:
+    first = _RecordingProvider(error=ProviderTimeoutError("timed out"))
+    second = _RecordingProvider(result="ok")
+
+    _correct(_service(first, second), style="formal")
+
+    # The second slot gets the same formal prompt, not the preserve one.
+    assert first.calls[0][0] == FORMAL_SYSTEM_PROMPT
+    assert second.calls[0][0] == FORMAL_SYSTEM_PROMPT
+
+
+def test_every_documented_style_maps_to_its_own_prompt() -> None:
+    assert set(SYSTEM_PROMPTS) == {"preserve", "formal"}
+    assert SYSTEM_PROMPTS["preserve"] == PRESERVE_SYSTEM_PROMPT
+    assert SYSTEM_PROMPTS["formal"] == FORMAL_SYSTEM_PROMPT
+    assert get_system_prompt("preserve") != get_system_prompt("formal")
 
 
 def test_each_slot_is_attempted_at_most_once() -> None:
@@ -218,7 +264,10 @@ def test_endpoint_returns_the_correction(
     response = provider_client.post(CORRECT_URL, json={"text": PERSIAN_TEXT})
 
     assert response.status_code == 200
-    assert response.json() == {"corrected_text": CORRECTED_TEXT}
+    body = response.json()
+    assert body["corrected_text"] == CORRECTED_TEXT
+    assert body["model_used"] == SLOT_1_TEST_MODEL
+    assert body["provider_name"] == "slot-1"
 
 
 def test_endpoint_sends_the_correction_prompt_and_only_that_slots_key(
@@ -234,9 +283,28 @@ def test_endpoint_sends_the_correction_prompt_and_only_that_slots_key(
     body = json.loads(request.content)
     assert body["model"] == SLOT_1_TEST_MODEL
     assert body["messages"] == [
-        {"role": "system", "content": PERSIAN_PROOFREADING_SYSTEM_PROMPT},
+        {"role": "system", "content": PRESERVE_SYSTEM_PROMPT},
         {"role": "user", "content": "متن"},
     ]
     # The key travels in the header, never in the URL, and only slot 1's key.
     assert request.headers["Authorization"] == f"Bearer {SLOT_1_KEY}"
     assert SLOT_1_KEY not in str(request.url)
+
+
+def test_endpoint_sends_the_formal_prompt_when_that_style_is_requested(
+    provider_transport: ProviderTransport,
+    provider_client: TestClient,
+    provider_slots: None,
+) -> None:
+    provider_transport.respond(lambda _: chat_completion_response(CORRECTED_TEXT))
+
+    response = provider_client.post(
+        CORRECT_URL, json={"text": "متن", "style": "formal"}
+    )
+
+    assert response.status_code == 200
+    body = json.loads(provider_transport.requests[0].content)
+    assert body["messages"] == [
+        {"role": "system", "content": FORMAL_SYSTEM_PROMPT},
+        {"role": "user", "content": "متن"},
+    ]

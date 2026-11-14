@@ -16,16 +16,15 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Callable, Iterator
-from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 import app.config as app_config
-from app.config import settings
 from app.main import app
 from app.services.correction import CorrectionResult, get_correction_service
+from app.services.prompt import CorrectionStyle
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -54,10 +53,10 @@ _SLOT_VARIABLE_PATTERN = re.compile(
 class StubCorrectionService:
     """Test double for :class:`~app.services.correction.CorrectionService`.
 
-    Records the text it receives and either returns ``result`` or raises
-    ``error``, which lets tests simulate both successful and failing providers.
-    ``provider``/``model`` stand in for the adapter that produced the text, so a
-    test can check what the evaluation log would record.
+    Records the text and style it receives and either returns ``result`` or
+    raises ``error``, which lets tests simulate both successful and failing
+    providers. ``provider``/``model`` stand in for the adapter that produced the
+    text.
     """
 
     def __init__(
@@ -72,9 +71,13 @@ class StubCorrectionService:
         self.provider = provider
         self.model = model
         self.received: list[str] = []
+        self.styles: list[str] = []
 
-    async def correct(self, text: str) -> CorrectionResult:
+    async def correct(
+        self, text: str, style: CorrectionStyle = "preserve"
+    ) -> CorrectionResult:
         self.received.append(text)
+        self.styles.append(style)
 
         if self.error is not None:
             raise self.error
@@ -255,21 +258,6 @@ def reset_slot_cooldowns() -> Iterator[None]:
     yield
 
     correction_module._cooldowns.reset()
-
-
-@pytest.fixture(autouse=True)
-def correction_log_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point the evaluation log at a temporary file (never the real logs/).
-
-    Autouse, so *no* test can append to the deployment's configured
-    ``logs/corrections.jsonl`` even if it forgets to ask for this fixture. The
-    temporary path is returned so a test can read back the JSON Lines rows that
-    were written; the file is not created until a consented write happens.
-    """
-    path = tmp_path / "logs" / "corrections.jsonl"
-    monkeypatch.setattr(settings, "correction_log_path", path)
-
-    return path
 
 
 # --- Shared provider response builders -------------------------------------- #

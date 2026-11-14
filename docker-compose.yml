@@ -6,23 +6,12 @@ services:
       context: ./backend
     ports:
       - "8000:8000"
-    environment:
-      # The only backend setting Compose overrides. Consented evaluation records
-      # are written to the mounted host directory instead of the image layer, so
-      # they survive a container recreate. `logs/` is git-ignored.
-      #
-      # APP_ENV, MAX_TEXT_LENGTH, CORS_ORIGINS, and the provider settings are NOT
-      # set here: they come from the root `.env` (env_file below) or the
-      # application defaults, so one `.env` configures both workflows.
-      CORRECTION_LOG_PATH: /app/logs/corrections.jsonl
     env_file:
       - path: .env
         required: false
     volumes:
       # Mount only the application package for reload during development.
       - ./backend/app:/app/app
-      # Keep consented evaluation logs on the host (git-ignored `logs/`).
-      - ./logs:/app/logs
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     healthcheck:
       test:

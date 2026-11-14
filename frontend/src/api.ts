@@ -10,6 +10,10 @@ export const MAX_TEXT_LENGTH = 1000;
 
 const DEFAULT_API_BASE_URL = "http://localhost:8000";
 const CORRECT_PATH = "/api/v1/correct";
+const EXPORT_DOCX_PATH = "/api/v1/export-docx";
+
+/** Suggested filename of the generated Word file (`word-export-spec.md`). */
+export const EXPORT_FILENAME = "virastar-export.docx";
 
 /** Shown when the request never reached the backend. */
 export const NETWORK_ERROR_MESSAGE =
@@ -75,31 +79,56 @@ function extractError(payload: unknown): CorrectionApiError {
   return new CorrectionApiError("INTERNAL_ERROR", UNEXPECTED_ERROR_MESSAGE);
 }
 
-/** Read `corrected_text`, or `null` when the body is not a usable success. */
-function extractCorrectedText(payload: unknown): string | null {
+/**
+ * A successful correction together with the provider slot that produced it.
+ *
+ * `modelUsed` and `providerName` are empty when the backend does not report
+ * them, so an older backend response still yields a usable correction.
+ */
+export interface CorrectionResult {
+  text: string;
+  modelUsed: string;
+  providerName: string;
+}
+
+/** Read the optional metadata string, defaulting to `""`. */
+function optionalString(body: Record<string, unknown>, key: string): string {
+  const value = body[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/** Read a usable success body, or `null` when `corrected_text` is missing. */
+function extractCorrection(payload: unknown): CorrectionResult | null {
   if (payload !== null && typeof payload === "object") {
-    const value = (payload as Record<string, unknown>).corrected_text;
+    const body = payload as Record<string, unknown>;
+    const value = body.corrected_text;
     if (typeof value === "string" && value.trim() !== "") {
-      return value;
+      return {
+        text: value,
+        modelUsed: optionalString(body, "model_used"),
+        providerName: optionalString(body, "provider_name"),
+      };
     }
   }
   return null;
 }
 
 /**
- * Consent choice for the optional evaluation log (`context/correction-logging.md`).
+ * Proofreading style accepted by `POST /api/v1/correct` (`api-contract.md`).
  *
- * The flag is always sent explicitly, and the backend — not the browser — is
- * what enforces it: `true` allows storing the submitted and corrected text for
- * quality evaluation, `false` stores neither.
+ * `preserve` corrects errors without changing the writer's tone and register;
+ * `formal` also rewrites the text in a formal, administrative register.
  */
+export type CorrectionStyle = "preserve" | "formal";
+
 export interface CorrectionRequestOptions {
-  storeForEvaluation: boolean;
+  style: CorrectionStyle;
   signal?: AbortSignal;
 }
 
 /**
- * Send `text` to `POST /api/v1/correct` and resolve with the corrected text.
+ * Send `text` to `POST /api/v1/correct` in the chosen `style` and resolve with
+ * the corrected text and the provider slot that produced it.
  *
  * Never fabricates a result: any failure rejects with a
  * {@link CorrectionApiError} (or the abort error raised by `fetch`).
@@ -107,18 +136,103 @@ export interface CorrectionRequestOptions {
 export async function requestCorrection(
   text: string,
   options: CorrectionRequestOptions,
-): Promise<string> {
+): Promise<CorrectionResult> {
+  const payload = await postJson(
+    CORRECT_PATH,
+    { text, style: options.style },
+    options.signal,
+  );
+
+  const result = extractCorrection(payload);
+  if (result === null) {
+    throw new CorrectionApiError("INTERNAL_ERROR", UNEXPECTED_ERROR_MESSAGE);
+  }
+
+  return result;
+}
+
+/**
+ * Formatting options of `POST /api/v1/export-docx`, mirroring `ExportOptions`
+ * on the backend and the defaults documented in `context/word-export-spec.md`.
+ */
+export type ExportFont = "Vazirmatn" | "Sahel" | "Tahoma";
+export type ExportFontSize = 12 | 14 | 16 | 18;
+export type ExportLineSpacing = 1 | 1.15 | 1.5 | 2;
+export type ExportAlignment = "right" | "justify" | "center";
+export type ExportMargins = "normal" | "narrow" | "wide";
+export type ExportPageNumberPosition = "center" | "right";
+
+export interface ExportOptions {
+  font: ExportFont;
+  font_size: ExportFontSize;
+  line_spacing: ExportLineSpacing;
+  alignment: ExportAlignment;
+  margins: ExportMargins;
+  page_numbers: boolean;
+  page_number_position: ExportPageNumberPosition;
+  page_border: boolean;
+}
+
+/** The spec's defaults; an untouched settings form sends exactly these. */
+export const DEFAULT_EXPORT_OPTIONS: ExportOptions = {
+  font: "Vazirmatn",
+  font_size: 14,
+  line_spacing: 1.5,
+  alignment: "justify",
+  margins: "normal",
+  page_numbers: true,
+  page_number_position: "center",
+  page_border: false,
+};
+
+/**
+ * Send the corrected text and the chosen options to `POST /api/v1/export-docx`
+ * and resolve with the generated `.docx` file.
+ *
+ * Failure uses the same {@link CorrectionApiError} as the correction request,
+ * because both endpoints share the documented `{error, message}` envelope.
+ */
+export async function requestDocxExport(
+  text: string,
+  options: ExportOptions,
+): Promise<Blob> {
   let response: Response;
 
   try {
-    response = await fetch(`${apiBaseUrl()}${CORRECT_PATH}`, {
+    response = await fetch(`${apiBaseUrl()}${EXPORT_DOCX_PATH}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text,
-        store_for_evaluation: options.storeForEvaluation,
-      }),
-      signal: options.signal,
+      body: JSON.stringify({ text, options }),
+    });
+  } catch {
+    throw new CorrectionApiError("NETWORK_ERROR", NETWORK_ERROR_MESSAGE);
+  }
+
+  if (!response.ok) {
+    throw extractError(await readJson(response));
+  }
+
+  try {
+    return await response.blob();
+  } catch {
+    throw new CorrectionApiError("INTERNAL_ERROR", UNEXPECTED_ERROR_MESSAGE);
+  }
+}
+
+/** POST a JSON body and return the parsed success body or throw the API error. */
+async function postJson(
+  path: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  let response: Response;
+
+  try {
+    response = await fetch(`${apiBaseUrl()}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
     });
   } catch (error) {
     // Caller-initiated cancellation must not be reported as a network failure.
@@ -134,10 +248,5 @@ export async function requestCorrection(
     throw extractError(payload);
   }
 
-  const correctedText = extractCorrectedText(payload);
-  if (correctedText === null) {
-    throw new CorrectionApiError("INTERNAL_ERROR", UNEXPECTED_ERROR_MESSAGE);
-  }
-
-  return correctedText;
+  return payload;
 }
